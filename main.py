@@ -18,10 +18,12 @@ def check_odds():
         data = response.json()
         matches = data.get("data", {}).get("list", [])
     except Exception:
-        print("Could not fetch data.")
+        send_telegram_alert("⚠️ Daily Scan Error: Could not reach AiScore servers today.")
         return
 
     found = 0
+    total_scanned = len(matches)
+
     for match in matches:
         home = match.get("homeTeam", {}).get("name", "Home")
         away = match.get("awayTeam", {}).get("name", "Away")
@@ -49,8 +51,10 @@ def check_odds():
                     )
                     send_telegram_alert(msg)
     
-    print(f"Done. Found {found} matches.")
+    # Always send a confirmation message so you know it ran!
+    if found == 0:
+        send_telegram_alert(f"✅ Daily Scan Complete!\nScanned {total_scanned} matches today.\n0 matches met your criteria.")
 
 if __name__ == "__main__":
     check_odds()
-  
+    
