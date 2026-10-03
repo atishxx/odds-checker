@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -160,50 +160,179 @@ def _normalise_fixture_href(href: str) -> Optional[Fixture]:
     return Fixture(match_id=match_id, slug=slug, url=base_url, home=home, away=away)
 
 
-def _target_home_url() -> str:
+def _target_home_urls() -> List[str]:
+    """Return discovery pages in priority order.
+
+    AiScore's generic homepage no longer reliably renders canonical match links.
+    The dedicated football day page does, so use it first for live/current scans.
+    Keep the old dated homepage as a compatibility fallback for manual backfills.
+    """
     if not SCAN_DATE:
-        return "https://www.aiscore.com/"
+        return [
+            "https://www.aiscore.com/today-matches/football",
+            "https://www.aiscore.com/live",
+            "https://www.aiscore.com/",
+        ]
+
     raw = SCAN_DATE.strip()
     if re.fullmatch(r"\d{8}", raw):
         raw = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
-    return f"https://www.aiscore.com/?date={raw}"
+
+    # AiScore has changed historical-date routing more than once. Try both the
+    # dedicated day page with the date query and the legacy homepage query.
+    return [
+        f"https://www.aiscore.com/today-matches/football?date={raw}",
+        f"https://www.aiscore.com/?date={raw}",
+    ]
+
+
+def _extract_match_urls_from_object(obj: Any) -> List[str]:
+    """Recursively recover canonical match URLs embedded in JSON/Next data."""
+    found: List[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for k, v in value.items():
+                walk(k)
+                walk(v)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str):
+            text = value.replace("\\/", "/")
+            for m in MATCH_RE.finditer(text):
+                found.append(m.group(0))
+
+    walk(obj)
+    return found
+
+
+def _collect_fixture_candidates(page, captured_json: List[Any]) -> Tuple[List[str], List[str]]:
+    """Collect every href plus canonical match candidates from DOM/HTML/JSON."""
+    try:
+        hrefs = page.locator("a[href]").evaluate_all(
+            "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
+        )
+    except Exception:
+        hrefs = []
+
+    candidates: List[str] = []
+    for href in hrefs:
+        if MATCH_RE.search(href or ""):
+            candidates.append(href)
+
+    try:
+        html = page.content().replace("\\/", "/")
+    except Exception:
+        html = ""
+    for m in MATCH_RE.finditer(html):
+        candidates.append(m.group(0))
+
+    for payload in captured_json:
+        candidates.extend(_extract_match_urls_from_object(payload))
+
+    return hrefs, candidates
+
+
+def _save_discovery_debug(page, target: str, hrefs: List[str], response_urls: List[str]) -> None:
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        page.screenshot(path=os.path.join(DEBUG_DIR, "fixture_discovery.png"), full_page=True)
+        with open(os.path.join(DEBUG_DIR, "fixture_discovery.html"), "w", encoding="utf-8") as fh:
+            fh.write(page.content())
+        with open(os.path.join(DEBUG_DIR, "fixture_discovery.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "target": target,
+                    "final_url": page.url,
+                    "title": page.title(),
+                    "href_count": len(hrefs),
+                    "hrefs": hrefs[:1000],
+                    "response_urls": response_urls[-500:],
+                },
+                fh,
+                indent=2,
+                ensure_ascii=False,
+            )
+        logger.info("Saved fixture discovery diagnostics in %s/", DEBUG_DIR)
+    except Exception as exc:
+        logger.warning("Could not save fixture discovery diagnostics: %s", exc)
 
 
 def discover_fixtures(page) -> List[Fixture]:
-    target = _target_home_url()
-    logger.info("Opening AiScore fixture page: %s", target)
-    page.goto(target, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_timeout(4500)
-
-    # AiScore lazy-loads/virtualises some rows; several scrolls reveal more match links.
-    for _ in range(8):
-        page.mouse.wheel(0, 2200)
-        page.wait_for_timeout(450)
-    page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(400)
-
-    hrefs = page.locator('a[href*="/match-"]').evaluate_all(
-        "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
-    )
-
     fixtures: Dict[str, Fixture] = {}
-    for href in hrefs:
-        fixture = _normalise_fixture_href(href)
-        if fixture:
-            fixtures.setdefault(fixture.match_id, fixture)
+    all_hrefs: List[str] = []
+    response_urls: List[str] = []
+    captured_json: List[Any] = []
+    last_target = ""
 
-    # Fallback: links may be rendered in canonical/meta markup even when cards are virtualised.
-    if not fixtures:
-        html = page.content()
-        for m in MATCH_RE.finditer(html):
-            fixture = _normalise_fixture_href(m.group(0))
-            if fixture:
-                fixtures.setdefault(fixture.match_id, fixture)
+    def on_response(response):
+        try:
+            if "aiscore.com" not in response.url:
+                return
+            response_urls.append(response.url)
+            ctype = (response.headers.get("content-type") or "").lower()
+            if response.status == 200 and "json" in ctype:
+                try:
+                    captured_json.append(response.json())
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    out = list(fixtures.values())[:MAX_MATCHES]
-    logger.info("Discovered %s unique AiScore match pages.", len(out))
-    return out
+    page.on("response", on_response)
+    try:
+        for target in _target_home_urls():
+            last_target = target
+            logger.info("Opening AiScore fixture page: %s", target)
+            try:
+                page.goto(target, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(3500)
+            except PlaywrightTimeoutError:
+                logger.warning("Fixture page timed out: %s", target)
+                continue
 
+            # AiScore virtualises/lazy-loads parts of the fixture list.
+            # Scroll in smaller steps and collect after each step so links that are
+            # removed from the DOM later are still retained.
+            for _ in range(10):
+                hrefs, candidates = _collect_fixture_candidates(page, captured_json)
+                all_hrefs.extend(hrefs)
+                for href in candidates:
+                    fixture = _normalise_fixture_href(href)
+                    if fixture:
+                        fixtures.setdefault(fixture.match_id, fixture)
+                if len(fixtures) >= MAX_MATCHES:
+                    break
+                page.mouse.wheel(0, 1600)
+                page.wait_for_timeout(350)
+
+            # One final pass after scrolling.
+            hrefs, candidates = _collect_fixture_candidates(page, captured_json)
+            all_hrefs.extend(hrefs)
+            for href in candidates:
+                fixture = _normalise_fixture_href(href)
+                if fixture:
+                    fixtures.setdefault(fixture.match_id, fixture)
+
+            logger.info(
+                "Discovery pass found %d canonical match IDs from %s",
+                len(fixtures),
+                page.url,
+            )
+            if len(fixtures) >= min(MAX_MATCHES, 20):
+                break
+
+        out = list(fixtures.values())[:MAX_MATCHES]
+        logger.info("Discovered %s unique AiScore match pages.", len(out))
+        if not out:
+            _save_discovery_debug(page, last_target, list(dict.fromkeys(all_hrefs)), response_urls)
+        return out
+    finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
 
 def _is_decimal_odd(value: float) -> bool:
     return 1.0 < value <= 100.0
@@ -378,6 +507,41 @@ def save_debug_capture(page, fixture: Fixture, reason: str) -> None:
         logger.debug("Debug capture failed: %s", exc)
 
 
+
+def _update_fixture_names_from_page(page, fixture: Fixture) -> None:
+    """Improve team names from AiScore's rendered title when the canonical slug is ambiguous."""
+    try:
+        title = page.title().strip()
+    except Exception:
+        return
+    patterns = [
+        r"(?:^|\d{4}/\d{2}/\d{2}\s+)(.+?)\s+vs\s+(.+?)\s+betting odds\s+-\s+AiScore",
+        r"(.+?)\s+vs\s+(.+?)\s+live score.*?\s+-\s+AiScore",
+        r"(.+?)\s+vs\s+(.+?)\s+-\s+AiScore",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, title, flags=re.I)
+        if m:
+            home = re.sub(r"\s+", " ", m.group(1)).strip(" -")
+            away = re.sub(r"\s+", " ", m.group(2)).strip(" -")
+            if home and away:
+                fixture.home = home
+                fixture.away = away
+                return
+
+
+def _save_captured_odds_json(fixture: Fixture, captured_json: List[Dict[str, Any]]) -> None:
+    if not captured_json:
+        return
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", fixture.match_id)[:80]
+        with open(os.path.join(DEBUG_DIR, f"{safe}_network.json"), "w", encoding="utf-8") as fh:
+            json.dump(captured_json, fh, indent=2, ensure_ascii=False)
+        logger.info("Saved %d captured odds/match JSON payload(s) for %s", len(captured_json), fixture.match_id)
+    except Exception as exc:
+        logger.debug("Could not save captured odds JSON: %s", exc)
+
 def scrape_fixture_odds(page, fixture: Fixture) -> List[OddsRow]:
     logger.info("Odds page: %s vs %s -> %s", fixture.home, fixture.away, fixture.odds_url)
 
@@ -399,6 +563,7 @@ def scrape_fixture_odds(page, fixture: Fixture) -> List[OddsRow]:
     try:
         page.goto(fixture.odds_url, wait_until="domcontentloaded", timeout=40000)
         page.wait_for_timeout(2800)
+        _update_fixture_names_from_page(page, fixture)
 
         # The dedicated page can default to Asian Handicap. Select 1X2 when the tab exists.
         for label in ("1 X 2", "1X2"):
@@ -432,6 +597,7 @@ def scrape_fixture_odds(page, fixture: Fixture) -> List[OddsRow]:
                 len(captured_json),
             )
             save_debug_capture(page, fixture, "no_odds")
+            _save_captured_odds_json(fixture, captured_json)
         else:
             logger.info("Parsed %d 1X2 odds row(s) for %s vs %s", len(rows), fixture.home, fixture.away)
         return rows
