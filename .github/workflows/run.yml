@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       scan_date:
-        description: 'Enter Date (YYYYMMDD e.g. 20261005) or leave empty for today:'
+        description: 'Enter Date (YYYYMMDD) or leave empty for today:'
         required: false
         default: ''
 
@@ -18,11 +18,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install requests playwright
+      - run: pip install requests playwright curl_cffi
       - run: playwright install chromium --with-deps
       - env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SCAN_DATE: ${{ github.event.inputs.scan_date }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python main.py
         
