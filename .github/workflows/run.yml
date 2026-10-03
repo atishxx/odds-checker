@@ -1,29 +1,67 @@
-name: Daily Odds Check
+name: AiScore Odds Check
 
 on:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       scan_date:
-        description: 'Enter Date (YYYYMMDD) or leave empty for today:'
+        description: 'Date: YYYYMMDD or YYYY-MM-DD (leave empty for today)'
         required: false
         default: ''
+      max_matches:
+        description: 'Maximum matches to inspect'
+        required: false
+        default: '120'
+
+concurrency:
+  group: aiscore-odds-checker
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install requests playwright curl_cffi
-      - run: playwright install chromium --with-deps
-      - env:
+
+      - name: Restore scanner state
+        uses: actions/cache@v4
+        with:
+          path: odds_tracker.db
+          key: odds-tracker-${{ github.run_id }}
+          restore-keys: |
+            odds-tracker-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Run AiScore scanner
+        env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SCAN_DATE: ${{ github.event.inputs.scan_date }}
+          MAX_MATCHES: ${{ github.event.inputs.max_matches || '120' }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
+          HEADLESS: 'true'
         run: python main.py
-        
+
+      - name: Upload scraper diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiscore-debug-${{ github.run_id }}
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 3
+          
