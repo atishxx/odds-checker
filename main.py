@@ -1,26 +1,79 @@
 import os
 import json
 import time
+import sqlite3
+import logging
 import requests
+from typing import List, Dict, Any, Optional
+from curl_cffi import requests as cffi_requests
 from playwright.sync_api import sync_playwright
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# System Configurations
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_DATE = os.getenv("SCAN_DATE", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip()  # Format: "http://user:pass@ip:port"
+DB_FILE = "odds_tracker.db"
 
-def send_telegram_alert(message):
+# Configure Logging Stream
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("OddsEngine")
+
+# --- DATABASE STATE ENGINE ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alerted_matches (
+            match_id TEXT PRIMARY KEY,
+            alert_type TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def is_already_alerted(match_id: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM alerted_matches WHERE match_id = ?", (match_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+def record_alert(match_id: str, alert_type: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO alerted_matches (match_id, alert_type) VALUES (?, ?)",
+        (match_id, alert_type)
+    )
+    conn.commit()
+    conn.close()
+
+# --- TELEGRAM NOTIFICATION SYSTEM ---
+def send_telegram_alert(message: str) -> bool:
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        return
+        logger.warning("Telegram credentials missing. Skipping dispatch.")
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for _ in range(3):
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    for attempt in range(3):
         try:
-            res = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+            res = requests.post(url, json=payload, timeout=10)
             if res.status_code == 200:
-                break
-        except Exception:
+                return True
+            logger.warning(f"Telegram returned HTTP {res.status_code}")
+        except Exception as e:
+            logger.error(f"Telegram alert error (Attempt {attempt+1}): {e}")
             time.sleep(1)
+    return False
 
-def extract_odds_history(match):
+# --- DATA PARSER & QUANT ENGINE ---
+def extract_odds_history(match: Dict[str, Any]) -> List[List[float]]:
     odds_hist = match.get("oddsHistory", {}).get("1x2", [])
     if len(odds_hist) >= 2:
         return odds_hist
@@ -39,7 +92,7 @@ def extract_odds_history(match):
 
     return []
 
-def eval_classic_drop(odds_history):
+def eval_classic_drop(odds_history: List[List[float]]) -> Optional[str]:
     if len(odds_history) < 2:
         return None
     
@@ -60,7 +113,7 @@ def eval_classic_drop(odds_history):
             return "NEAR_MISS"
     return None
 
-def eval_sharp_move(odds_history):
+def eval_sharp_move(odds_history: List[List[float]]):
     if len(odds_history) < 2:
         return None, 0.0
 
@@ -99,37 +152,66 @@ def eval_sharp_move(odds_history):
 
     return None, prob_shift
 
-def fetch_matches_network_interception():
+# --- DUAL-ENGINE SCRAPING ARCHITECTURE ---
+def fetch_via_cffi() -> List[Dict[str, Any]]:
+    """Primary Execution Tier: C-Based TLS Fingerprint Spoofing"""
+    url = "https://api.aiscore.com/api/v1/match/list"
+    if SCAN_DATE:
+        url = f"https://api.aiscore.com/api/v1/match/list?date={SCAN_DATE}"
+
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.aiscore.com/",
+        "Origin": "https://www.aiscore.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+
+    try:
+        logger.info("Executing Tier 1 Scraping: TLS Impersonation (curl_cffi)...")
+        response = cffi_requests.get(url, headers=headers, proxies=proxies, impersonate="chrome120", timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            matches = data.get("data", {}).get("list", [])
+            if matches:
+                logger.info(f"Tier 1 Success: Acquired {len(matches)} match records.")
+                return matches
+    except Exception as e:
+        logger.error(f"Tier 1 Scraper failed: {e}")
+    return []
+
+def fetch_via_playwright() -> List[Dict[str, Any]]:
+    """Secondary Execution Tier: Headless Browser Network Interception"""
+    logger.info("Executing Tier 2 Scraping: Playwright DOM Interceptor...")
     captured_matches = []
 
+    launch_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage"
+    ]
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--window-size=1920,1080"
-            ]
-        )
+        browser_options = {"headless": True, "args": launch_args}
+        if PROXY_URL:
+            browser_options["proxy"] = {"server": PROXY_URL}
+
+        browser = p.chromium.launch(**browser_options)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080}
         )
         page = context.new_page()
 
-        # Stealth mask
-        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-        # Live Stream Interceptor: Trap JSON data straight from the browser wire
         def intercept_response(response):
             nonlocal captured_matches
-            if "/api/v1/match/list" in response.url or "/match/list" in response.url:
+            if "match" in response.url and response.status == 200:
                 try:
                     data = response.json()
-                    match_list = data.get("data", {}).get("list", [])
-                    if match_list:
+                    match_list = data.get("data", {}).get("list", []) or data.get("list", [])
+                    if match_list and isinstance(match_list, list):
                         captured_matches = match_list
                 except Exception:
                     pass
@@ -141,50 +223,29 @@ def fetch_matches_network_interception():
             target_url = f"https://www.aiscore.com/?date={SCAN_DATE}"
 
         try:
-            # Navigate to web app to trigger Cloudflare clearance & internal API calls
-            page.goto(target_url, wait_until="domcontentloaded", timeout=35000)
-            
-            # Human motion emulation to trigger Turnstile solve
-            page.mouse.move(100, 200)
-            page.mouse.wheel(0, 500)
-            page.wait_for_timeout(5000)
-
-            # Fallback trigger: If response wasn't passively trapped, force XHR inside authenticated browser frame
-            if not captured_matches:
-                api_target = "https://api.aiscore.com/api/v1/match/list"
-                if SCAN_DATE:
-                    api_target = f"https://api.aiscore.com/api/v1/match/list?date={SCAN_DATE}"
-
-                raw_json = page.evaluate(f"""
-                    async () => {{
-                        return new Promise((resolve) => {{
-                            const xhr = new XMLHttpRequest();
-                            xhr.open('GET', '{api_target}', true);
-                            xhr.onload = function() {{
-                                if (xhr.status === 200) {{
-                                    resolve(xhr.responseText);
-                                }} else {{
-                                    resolve(null);
-                                }}
-                            }};
-                            xhr.onerror = function() {{ resolve(null); }};
-                            xhr.send();
-                        }});
-                    }}
-                """)
-                if raw_json:
-                    parsed = json.loads(raw_json)
-                    captured_matches = parsed.get("data", {}).get("list", [])
-
+            page.goto(target_url, wait_until="networkidle", timeout=35000)
+            page.wait_for_timeout(4000)
         except Exception as e:
-            print(f"Interception error: {e}")
+            logger.error(f"Tier 2 Playwright Execution error: {e}")
         finally:
             browser.close()
 
+    logger.info(f"Tier 2 Scraping Complete: Captured {len(captured_matches)} match records.")
     return captured_matches
 
-def check_odds():
-    matches = fetch_matches_network_interception()
+# --- PIPELINE CONTROLLER ---
+def run_engine():
+    init_db()
+
+    # Automatic Failover Routing
+    matches = fetch_via_cffi()
+    if not matches:
+        matches = fetch_via_playwright()
+
+    if not matches:
+        logger.error("Critical Failure: All scraping tiers exhausted with zero records.")
+        send_telegram_alert("🚨 <b>CRITICAL SYSTEM ALERT</b>\nScraper execution failed across all tiers.")
+        return
 
     found_sharp = 0
     found_classic = 0
@@ -192,10 +253,11 @@ def check_odds():
     total_scanned = len(matches)
 
     for match in matches:
+        match_id = str(match.get("id") or match.get("matchId") or f"{match.get('homeTeam', {}).get('name')}_{match.get('awayTeam', {}).get('name')}")
         home = match.get("homeTeam", {}).get("name", "Home")
         away = match.get("awayTeam", {}).get("name", "Away")
         league = match.get("leagueName", "League")
-        
+
         odds_history = extract_odds_history(match)
         if not odds_history:
             continue
@@ -208,17 +270,21 @@ def check_odds():
         is_near_miss = (sharp_res == "NEAR_MISS" or classic_res == "NEAR_MISS") and not (is_sharp_match or is_classic_match)
 
         if is_sharp_match or is_classic_match or is_near_miss:
+            # Deduplication Barrier
+            if is_already_alerted(match_id):
+                logger.info(f"Deduplicated match alert: {home} vs {away}")
+                continue
+
             open_h, open_d, open_a = odds_history[0][0], odds_history[0][1], odds_history[0][2]
             curr_h, curr_d, curr_a = odds_history[-1][0], odds_history[-1][1], odds_history[-1][2]
 
             alert_type = []
-            
             if is_sharp_match:
                 found_sharp += 1
-                alert_type.append(f"⚡ SHARP STEAM (+{prob_shift:.1f}% Shift)")
+                alert_type.append(f"⚡ <b>SHARP STEAM</b> (+{prob_shift:.1f}% Shift)")
             if is_classic_match:
                 found_classic += 1
-                alert_type.append(f"💥 CLASSIC CRUSH (Drop >= 2.0)")
+                alert_type.append(f"💥 <b>CLASSIC CRUSH</b> (Drop >= 2.0)")
 
             if is_near_miss:
                 found_near_misses += 1
@@ -227,32 +293,33 @@ def check_odds():
                     near_details.append(f"Sharp Prob Shift +{prob_shift:.1f}% [Target +8.0%]")
                 if classic_res == "NEAR_MISS":
                     near_details.append(f"Home Drop {open_h - curr_h:.2f} [Target >= 2.0]")
-                alert_type.append(f"🎯 WATCHLIST ({', '.join(near_details)})")
+                alert_type.append(f"🎯 <b>WATCHLIST</b> ({', '.join(near_details)})")
 
-            header_icon = "🚨 APEX MATCH TRIGGER" if (is_sharp_match or is_classic_match) else "👀 HIGH PRIORITY WATCHLIST"
+            header_icon = "🚨 <b>APEX MATCH TRIGGER</b>" if (is_sharp_match or is_classic_match) else "👀 <b>HIGH PRIORITY WATCHLIST</b>"
 
             msg = (
                 f"{header_icon}\n"
-                f"Status: {' | '.join(alert_type)}\n\n"
-                f"🏆 League: {league}\n"
-                f"⚽ Match: {home} vs {away}\n\n"
-                f"📊 1X2 Odds Movement:\n"
+                f"<b>Status:</b> {' | '.join(alert_type)}\n\n"
+                f"🏆 <b>League:</b> {league}\n"
+                f"⚽ <b>Match:</b> {home} vs {away}\n\n"
+                f"📊 <b>1X2 Odds Movement:</b>\n"
                 f"• Home: {open_h} ➔ {curr_h}\n"
                 f"• Draw: {open_d} ➔ {curr_d}\n"
                 f"• Away: {open_a} ➔ {curr_a}"
             )
-            send_telegram_alert(msg)
+            
+            if send_telegram_alert(msg):
+                record_alert(match_id, "|".join(alert_type))
             time.sleep(0.5)
 
     target = f"Date [{SCAN_DATE}]" if SCAN_DATE else "Today"
     send_telegram_alert(
-        f"⚡ SCAN COMPLETE ({target})\n"
-        f"Matches Processed: {total_scanned}\n"
-        f"🔥 Sharp Steam Hits: {found_sharp}\n"
-        f"💥 Classic Line Crushes: {found_classic}\n"
-        f"🎯 Watchlist Candidates: {found_near_misses}"
+        f"⚡ <b>SCAN COMPLETE ({target})</b>\n"
+        f"• Matches Scanned: {total_scanned}\n"
+        f"• 🔥 Sharp Steam Hits: {found_sharp}\n"
+        f"• 💥 Classic Line Crushes: {found_classic}\n"
+        f"• 🎯 Watchlist Candidates: {found_near_misses}"
     )
 
 if __name__ == "__main__":
-    check_odds()
-    
+    run_engine()
