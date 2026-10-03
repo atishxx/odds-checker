@@ -14,56 +14,62 @@ def send_telegram_alert(message):
         except Exception as e:
             print(f"Telegram send error: {e}")
 
-def is_true_sharp_move(odds_history):
-    """
-    Calculates Vig-Free Implied Probability shift & filters out public/margin noise.
-    Returns: (is_sharp: bool, prob_shift_pct: float, reason: str)
-    """
-    if len(odds_history) < 3:
-        return False, 0.0, "Insufficient odds history"
+def eval_classic_drop(odds_history):
+    if len(odds_history) < 4:
+        return None
+    
+    opening_home, opening_draw = odds_history[0][0], odds_history[0][1]
+    current_home, current_draw = odds_history[-1][0], odds_history[-1][1]
+    home_line = [entry[0] for entry in odds_history[:4]]
 
-    # Opening lines [Home, Draw, Away] vs Current lines
+    drop_amount = opening_home - current_home
+
+    if (current_draw >= opening_draw) and all(home_line[i] > home_line[i+1] for i in range(len(home_line)-1)):
+        if drop_amount >= 2.0:
+            return "MATCH"
+        elif 1.2 <= drop_amount < 2.0:
+            return "NEAR_MISS"
+    return None
+
+def eval_sharp_move(odds_history):
+    if len(odds_history) < 3:
+        return None, 0.0
+
     open_h, open_d, open_a = odds_history[0][0], odds_history[0][1], odds_history[0][2]
     curr_h, curr_d, curr_a = odds_history[-1][0], odds_history[-1][1], odds_history[-1][2]
 
-    # Guard against invalid or 0 odds
     if any(x <= 1.0 for x in [open_h, open_d, open_a, curr_h, curr_d, curr_a]):
-        return False, 0.0, "Invalid odds values"
+        return None, 0.0
 
-    # 1. Raw Implied Probabilities
     raw_open_prob_h = 1.0 / open_h
     raw_curr_prob_h = 1.0 / curr_h
 
-    # 2. Calculate Bookmaker Vig (Margin)
     open_vig = (1.0 / open_h) + (1.0 / open_d) + (1.0 / open_a)
     curr_vig = (1.0 / curr_h) + (1.0 / curr_d) + (1.0 / curr_a)
 
-    # 3. Calculate Vig-Free Fair Win Probabilities
     fair_open_prob_h = raw_open_prob_h / open_vig
     fair_curr_prob_h = raw_curr_prob_h / curr_vig
 
-    # Percentage jump in true win probability
     prob_shift = (fair_curr_prob_h - fair_open_prob_h) * 100.0
 
-    # --- SHARP FILTERS ---
-
-    # Rule A: True win probability must jump by at least +8.0%
-    if prob_shift < 8.0:
-        return False, prob_shift, "Probability shift < +8%"
-
-    # Rule B: Draw hedge shield (Reject if draw probability also increased significantly)
+    # Draw hedge check
     fair_open_prob_d = (1.0 / open_d) / open_vig
     fair_curr_prob_d = (1.0 / curr_d) / curr_vig
     if (fair_curr_prob_d - fair_open_prob_d) > 0.03:
-        return False, prob_shift, "Draw probability increased (mixed money signal)"
+        return None, prob_shift
 
-    # Rule C: Trajectory check (At least 2 consecutive downward steps)
+    # Trajectory check
     home_history = [entry[0] for entry in odds_history]
     drops = sum(1 for i in range(len(home_history) - 1) if home_history[i] > home_history[i + 1])
     if drops < 2:
-        return False, prob_shift, "Inconsistent downward line trajectory"
+        return None, prob_shift
 
-    return True, prob_shift, "Genuine Sharp Move"
+    if prob_shift >= 8.0:
+        return "MATCH", prob_shift
+    elif 5.0 <= prob_shift < 8.0:
+        return "NEAR_MISS", prob_shift
+
+    return None, prob_shift
 
 def check_odds():
     session = requests.Session()
@@ -83,7 +89,6 @@ def check_odds():
     try:
         session.get("https://www.aiscore.com/", headers=headers, timeout=10)
         time.sleep(1)
-        
         response = session.get(url, headers=headers, timeout=15)
         if response.status_code == 200:
             data = response.json()
@@ -91,7 +96,9 @@ def check_odds():
     except Exception as e:
         print(f"Error fetching data: {e}")
 
-    found = 0
+    found_sharp = 0
+    found_classic = 0
+    found_near_misses = 0
     total_scanned = len(matches)
 
     for match in matches:
@@ -100,18 +107,42 @@ def check_odds():
         league = match.get("leagueName", "League")
         odds_history = match.get("oddsHistory", {}).get("1x2", [])
 
-        is_sharp, prob_shift, reason = is_true_sharp_move(odds_history)
+        classic_res = eval_classic_drop(odds_history)
+        sharp_res, prob_shift = eval_sharp_move(odds_history)
 
-        if is_sharp:
-            found += 1
+        is_sharp_match = (sharp_res == "MATCH")
+        is_classic_match = (classic_res == "MATCH")
+        is_near_miss = (sharp_res == "NEAR_MISS" or classic_res == "NEAR_MISS") and not (is_sharp_match or is_classic_match)
+
+        if is_sharp_match or is_classic_match or is_near_miss:
             open_h, open_d, open_a = odds_history[0][0], odds_history[0][1], odds_history[0][2]
             curr_h, curr_d, curr_a = odds_history[-1][0], odds_history[-1][1], odds_history[-1][2]
 
+            alert_type = []
+            
+            if is_sharp_match:
+                found_sharp += 1
+                alert_type.append(f"🎯 SHARP MOVE (+{prob_shift:.1f}% Shift)")
+            if is_classic_match:
+                found_classic += 1
+                alert_type.append(f"📉 CLASSIC DROP (Drop >= 2.0)")
+
+            if is_near_miss:
+                found_near_misses += 1
+                near_details = []
+                if sharp_res == "NEAR_MISS":
+                    near_details.append(f"Sharp Prob Shift +{prob_shift:.1f}% [Target +8.0%]")
+                if classic_res == "NEAR_MISS":
+                    near_details.append(f"Home Drop {open_h - curr_h:.2f} [Target >= 2.0]")
+                alert_type.append(f"👀 NEAR MISS ({', '.join(near_details)})")
+
+            header_icon = "🚨 MATCH ALERT" if (is_sharp_match or is_classic_match) else "👀 WATCHLIST / NEAR MISS"
+
             msg = (
-                f"🎯 SHARP MONEY MOVEMENT DETECTED!\n\n"
+                f"{header_icon}\n"
+                f"Trigger: {' | '.join(alert_type)}\n\n"
                 f"🏆 League: {league}\n"
-                f"⚽ Match: {home} vs {away}\n"
-                f"📈 True Win Prob. Shift: +{prob_shift:.1f}%\n\n"
+                f"⚽ Match: {home} vs {away}\n\n"
                 f"📊 1X2 Odds Line:\n"
                 f"• Home: {open_h} ➔ {curr_h}\n"
                 f"• Draw: {open_d} ➔ {curr_d}\n"
@@ -121,9 +152,11 @@ def check_odds():
 
     target = f"Date [{SCAN_DATE}]" if SCAN_DATE else "Today"
     send_telegram_alert(
-        f"✅ Sharp Scan Complete ({target})\n"
+        f"✅ Daily Scan Complete ({target})\n"
         f"Scanned {total_scanned} matches.\n"
-        f"Found {found} genuine sharp movement(s)."
+        f"🎯 Full Sharp Matches: {found_sharp}\n"
+        f"📉 Full Classic Drops: {found_classic}\n"
+        f"👀 Watchlist / Near Misses: {found_near_misses}"
     )
 
 if __name__ == "__main__":
