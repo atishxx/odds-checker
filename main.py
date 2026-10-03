@@ -12,7 +12,7 @@ def send_telegram_alert(message):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for attempt in range(3):
+    for _ in range(3):
         try:
             res = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
             if res.status_code == 200:
@@ -21,20 +21,16 @@ def send_telegram_alert(message):
             time.sleep(1)
 
 def extract_odds_history(match):
-    """Deep schema extractor: Handles history arrays and secondary odds payloads."""
-    # Primary odds history key
     odds_hist = match.get("oddsHistory", {}).get("1x2", [])
     if len(odds_hist) >= 2:
         return odds_hist
 
-    # Fallback Schema 1: Nested odds dictionary
     odds_dict = match.get("odds", {})
     if isinstance(odds_dict, dict):
         hist = odds_dict.get("1x2", {}).get("history", [])
         if len(hist) >= 2:
             return hist
 
-    # Fallback Schema 2: Direct opening vs current line synthesis
     rates = match.get("rates", {}) or match.get("odds", {})
     if isinstance(rates, dict) and "1x2" in rates:
         line_data = rates["1x2"]
@@ -52,7 +48,6 @@ def eval_classic_drop(odds_history):
     
     drop_amount = opening_home - current_home
 
-    # Strict trajectory verification if 4+ history points exist
     trajectory_ok = True
     if len(odds_history) >= 4:
         home_line = [entry[0] for entry in odds_history[:4]]
@@ -75,7 +70,6 @@ def eval_sharp_move(odds_history):
     if any(x <= 1.0 for x in [open_h, open_d, open_a, curr_h, curr_d, curr_a]):
         return None, 0.0
 
-    # Vig-Free Math Engine
     raw_open_prob_h = 1.0 / open_h
     raw_curr_prob_h = 1.0 / curr_h
 
@@ -87,13 +81,11 @@ def eval_sharp_move(odds_history):
 
     prob_shift = (fair_curr_prob_h - fair_open_prob_h) * 100.0
 
-    # Draw Hedge Shield Protection
     fair_open_prob_d = (1.0 / open_d) / open_vig
     fair_curr_prob_d = (1.0 / curr_d) / curr_vig
     if (fair_curr_prob_d - fair_open_prob_d) > 0.03:
         return None, prob_shift
 
-    # Downward Trajectory Check
     if len(odds_history) >= 3:
         home_history = [entry[0] for entry in odds_history]
         drops = sum(1 for i in range(len(home_history) - 1) if home_history[i] > home_history[i + 1])
@@ -107,60 +99,92 @@ def eval_sharp_move(odds_history):
 
     return None, prob_shift
 
-def fetch_matches_ruthless():
-    url = "https://api.aiscore.com/api/v1/match/list"
-    if SCAN_DATE:
-        url = f"https://api.aiscore.com/api/v1/match/list?date={SCAN_DATE}"
+def fetch_matches_network_interception():
+    captured_matches = []
 
-    for attempt in range(1, 4):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--window-size=1920,1080"
+            ]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080}
+        )
+        page = context.new_page()
+
+        # Stealth mask
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        # Live Stream Interceptor: Trap JSON data straight from the browser wire
+        def intercept_response(response):
+            nonlocal captured_matches
+            if "/api/v1/match/list" in response.url or "/match/list" in response.url:
+                try:
+                    data = response.json()
+                    match_list = data.get("data", {}).get("list", [])
+                    if match_list:
+                        captured_matches = match_list
+                except Exception:
+                    pass
+
+        page.on("response", intercept_response)
+
+        target_url = "https://www.aiscore.com/"
+        if SCAN_DATE:
+            target_url = f"https://www.aiscore.com/?date={SCAN_DATE}"
+
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-blink-features=AutomationControlled",
-                        "--disable-dev-shm-usage"
-                    ]
-                )
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    viewport={"width": 1920, "height": 1080}
-                )
-                page = context.new_page()
-                page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            # Navigate to web app to trigger Cloudflare clearance & internal API calls
+            page.goto(target_url, wait_until="domcontentloaded", timeout=35000)
+            
+            # Human motion emulation to trigger Turnstile solve
+            page.mouse.move(100, 200)
+            page.mouse.wheel(0, 500)
+            page.wait_for_timeout(5000)
 
-                # Establish session cookies
-                page.goto("https://www.aiscore.com/", wait_until="domcontentloaded", timeout=25000)
-                page.wait_for_timeout(2000)
+            # Fallback trigger: If response wasn't passively trapped, force XHR inside authenticated browser frame
+            if not captured_matches:
+                api_target = "https://api.aiscore.com/api/v1/match/list"
+                if SCAN_DATE:
+                    api_target = f"https://api.aiscore.com/api/v1/match/list?date={SCAN_DATE}"
 
-                # Fetch directly at Playwright network level
-                res = context.request.get(
-                    url,
-                    headers={
-                        "Referer": "https://www.aiscore.com/",
-                        "Origin": "https://www.aiscore.com",
-                        "Accept": "application/json, text/plain, */*",
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    }
-                )
+                raw_json = page.evaluate(f"""
+                    async () => {{
+                        return new Promise((resolve) => {{
+                            const xhr = new XMLHttpRequest();
+                            xhr.open('GET', '{api_target}', true);
+                            xhr.onload = function() {{
+                                if (xhr.status === 200) {{
+                                    resolve(xhr.responseText);
+                                }} else {{
+                                    resolve(null);
+                                }}
+                            }};
+                            xhr.onerror = function() {{ resolve(null); }};
+                            xhr.send();
+                        }});
+                    }}
+                """)
+                if raw_json:
+                    parsed = json.loads(raw_json)
+                    captured_matches = parsed.get("data", {}).get("list", [])
 
-                if res.status == 200:
-                    data = res.json()
-                    browser.close()
-                    return data.get("data", {}).get("list", [])
-                
-                browser.close()
         except Exception as e:
-            print(f"Scraper execution attempt {attempt} failed: {e}")
-            time.sleep(2)
+            print(f"Interception error: {e}")
+        finally:
+            browser.close()
 
-    send_telegram_alert("⚠️ EXECUTION WARNING: Cloud scraper retries exhausted.")
-    return []
+    return captured_matches
 
 def check_odds():
-    matches = fetch_matches_ruthless()
+    matches = fetch_matches_network_interception()
 
     found_sharp = 0
     found_classic = 0
