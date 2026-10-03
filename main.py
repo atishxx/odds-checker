@@ -1,5 +1,6 @@
 import os
 import requests
+import time
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -7,19 +8,44 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 def send_telegram_alert(message):
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message})
+        try:
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+        except Exception as e:
+            print(f"Telegram send error: {e}")
 
 def check_odds():
-    url = "https://api.aiscore.com/api/v1/match/list" 
-    headers = {"User-Agent": "Mozilla/5.0"}
+    session = requests.Session()
     
+    # Browser spoofing headers to bypass Cloudflare blocks
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.aiscore.com/",
+        "Origin": "https://www.aiscore.com",
+        "Sec-Ch-Ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site"
+    }
+    
+    url = "https://api.aiscore.com/api/v1/match/list"
+    matches = []
+
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        data = response.json()
-        matches = data.get("data", {}).get("list", [])
-    except Exception:
-        send_telegram_alert("⚠️ Daily Scan Error: Could not reach AiScore servers today.")
-        return
+        # Establish session cookies from home page first
+        session.get("https://www.aiscore.com/", headers=headers, timeout=10)
+        time.sleep(1)
+        
+        # Fetch the live odds payload
+        response = session.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            matches = data.get("data", {}).get("list", [])
+    except Exception as e:
+        print(f"Error fetching data: {e}")
 
     found = 0
     total_scanned = len(matches)
@@ -50,10 +76,9 @@ def check_odds():
                         f"Draw Line: {opening_draw} ➔ {current_draw}"
                     )
                     send_telegram_alert(msg)
-    
-    # Always send a confirmation message so you know it ran!
-    if found == 0:
-        send_telegram_alert(f"✅ Daily Scan Complete!\nScanned {total_scanned} matches today.\n0 matches met your criteria.")
+
+    # Confirmation report
+    send_telegram_alert(f"✅ Daily Scan Complete!\nScanned {total_scanned} matches today.\n{found} matches met your criteria.")
 
 if __name__ == "__main__":
     check_odds()
