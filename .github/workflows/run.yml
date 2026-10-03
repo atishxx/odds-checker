@@ -1,8 +1,6 @@
-name: AiScore Odds Check
+name: AiScore Odds Check - Self Hosted
 
 on:
-  schedule:
-    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       scan_date:
@@ -14,13 +12,9 @@ on:
         required: false
         default: '120'
 
-concurrency:
-  group: aiscore-odds-checker
-  cancel-in-progress: false
-
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     permissions:
       contents: read
@@ -28,7 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -36,8 +31,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: odds_tracker.db
-          key: odds-tracker-${{ github.run_id }}
+          key: odds-tracker-selfhosted-${{ github.run_id }}
           restore-keys: |
+            odds-tracker-selfhosted-
             odds-tracker-
 
       - name: Install dependencies
@@ -51,14 +47,14 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SCAN_DATE: ${{ github.event.inputs.scan_date }}
           MAX_MATCHES: ${{ github.event.inputs.max_matches || '120' }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
+          AISCORE_BASES: https://vnm.aiscore.com,https://m.aiscore.com,https://www.aiscore.com
         run: python main.py
 
       - name: Upload scraper diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: aiscore-debug-${{ github.run_id }}
+          name: aiscore-debug-selfhosted-${{ github.run_id }}
           path: debug/
           if-no-files-found: ignore
           retention-days: 3
