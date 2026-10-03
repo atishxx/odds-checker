@@ -82,4 +82,3 @@ def check_odds():
 
 if __name__ == "__main__":
     check_odds()
-    
