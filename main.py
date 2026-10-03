@@ -1,325 +1,682 @@
 import os
+import re
 import json
 import time
 import sqlite3
 import logging
-import requests
-from typing import List, Dict, Any, Optional
-from curl_cffi import requests as cffi_requests
-from playwright.sync_api import sync_playwright
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import urlparse
 
-# System Configurations
+import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_DATE = os.getenv("SCAN_DATE", "").strip()
-PROXY_URL = os.getenv("PROXY_URL", "").strip()  # Format: "http://user:pass@ip:port"
-DB_FILE = "odds_tracker.db"
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+MAX_MATCHES = int(os.getenv("MAX_MATCHES", "120"))
+HEADLESS = os.getenv("HEADLESS", "true").lower() not in {"0", "false", "no"}
+DB_FILE = os.getenv("DB_FILE", "odds_tracker.db")
+DEBUG_DIR = os.getenv("DEBUG_DIR", "debug")
+DEBUG_CAPTURE_LIMIT = int(os.getenv("DEBUG_CAPTURE_LIMIT", "5"))
+_debug_capture_count = 0
 
-# Configure Logging Stream
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
 logger = logging.getLogger("OddsEngine")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# --- DATABASE STATE ENGINE ---
-def init_db():
+MATCH_RE = re.compile(r"/match-([^/?#]+)/([a-z0-9]+)", re.I)
+ODDS_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3})?)(?![\d.])")
+
+
+@dataclass
+class Fixture:
+    match_id: str
+    slug: str
+    url: str
+    home: str
+    away: str
+
+    @property
+    def odds_url(self) -> str:
+        return f"https://www.aiscore.com/match-{self.slug}/{self.match_id}/odds"
+
+
+@dataclass
+class OddsRow:
+    bookmaker: str
+    opening: Tuple[float, float, float]
+    prematch: Tuple[float, float, float]
+    inplay: Optional[Tuple[float, float, float]] = None
+
+
+@dataclass
+class Candidate:
+    side: str
+    status: str
+    bookmaker: str
+    opening: Tuple[float, float, float]
+    current: Tuple[float, float, float]
+    drop: float
+    drop_pct: float
+    fair_prob_shift: float
+    reason: str
+
+
+def init_db() -> None:
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='alerted_matches'")
+    exists = cur.fetchone() is not None
+    if exists:
+        cur.execute("PRAGMA table_info(alerted_matches)")
+        columns = {row[1] for row in cur.fetchall()}
+        required = {"match_id", "side", "alert_level", "alert_type", "timestamp"}
+        if not required.issubset(columns):
+            legacy = f"alerted_matches_legacy_{int(time.time())}"
+            cur.execute(f"ALTER TABLE alerted_matches RENAME TO {legacy}")
+            logger.info("Migrated legacy alert table to %s", legacy)
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS alerted_matches (
-            match_id TEXT PRIMARY KEY,
-            alert_type TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            match_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            alert_level INTEGER NOT NULL,
+            alert_type TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (match_id, side)
         )
-    """)
-    conn.commit()
-    conn.close()
-
-def is_already_alerted(match_id: str) -> bool:
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM alerted_matches WHERE match_id = ?", (match_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row is not None
-
-def record_alert(match_id: str, alert_type: str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO alerted_matches (match_id, alert_type) VALUES (?, ?)",
-        (match_id, alert_type)
+        """
     )
     conn.commit()
     conn.close()
 
-# --- TELEGRAM NOTIFICATION SYSTEM ---
+
+def get_alert_level(match_id: str, side: str) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT alert_level FROM alerted_matches WHERE match_id=? AND side=?", (match_id, side))
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else 0
+
+
+def record_alert(match_id: str, side: str, alert_level: int, alert_type: str) -> None:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO alerted_matches(match_id, side, alert_level, alert_type)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(match_id, side) DO UPDATE SET
+            alert_level=excluded.alert_level,
+            alert_type=excluded.alert_type,
+            timestamp=CURRENT_TIMESTAMP
+        """,
+        (match_id, side, alert_level, alert_type),
+    )
+    conn.commit()
+    conn.close()
+
+
 def send_telegram_alert(message: str) -> bool:
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        logger.warning("Telegram credentials missing. Skipping dispatch.")
+        logger.warning("Telegram credentials missing; message not sent.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
     for attempt in range(3):
         try:
-            res = requests.post(url, json=payload, timeout=10)
-            if res.status_code == 200:
+            res = requests.post(url, json=payload, timeout=15)
+            if res.ok:
                 return True
-            logger.warning(f"Telegram returned HTTP {res.status_code}")
-        except Exception as e:
-            logger.error(f"Telegram alert error (Attempt {attempt+1}): {e}")
-            time.sleep(1)
+            logger.warning("Telegram HTTP %s: %s", res.status_code, res.text[:250])
+        except Exception as exc:
+            logger.warning("Telegram attempt %s failed: %s", attempt + 1, exc)
+        time.sleep(1 + attempt)
     return False
 
-# --- DATA PARSER & QUANT ENGINE ---
-def extract_odds_history(match: Dict[str, Any]) -> List[List[float]]:
-    odds_hist = match.get("oddsHistory", {}).get("1x2", [])
-    if len(odds_hist) >= 2:
-        return odds_hist
 
-    odds_dict = match.get("odds", {})
-    if isinstance(odds_dict, dict):
-        hist = odds_dict.get("1x2", {}).get("history", [])
-        if len(hist) >= 2:
-            return hist
+def _humanize_slug(slug: str) -> Tuple[str, str]:
+    parts = re.split(r"-vs-", slug, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        parts = re.split(r"-v-", slug, maxsplit=1, flags=re.I)
+    if len(parts) == 2:
+        return parts[0].replace("-", " ").title(), parts[1].replace("-", " ").title()
+    return slug.replace("-", " ").title(), "Opponent"
 
-    rates = match.get("rates", {}) or match.get("odds", {})
-    if isinstance(rates, dict) and "1x2" in rates:
-        line_data = rates["1x2"]
-        if "open" in line_data and "current" in line_data:
-            return [line_data["open"], line_data["current"]]
 
-    return []
-
-def eval_classic_drop(odds_history: List[List[float]]) -> Optional[str]:
-    if len(odds_history) < 2:
+def _normalise_fixture_href(href: str) -> Optional[Fixture]:
+    if not href:
         return None
-    
-    opening_home, opening_draw = odds_history[0][0], odds_history[0][1]
-    current_home, current_draw = odds_history[-1][0], odds_history[-1][1]
-    
-    drop_amount = opening_home - current_home
+    m = MATCH_RE.search(href)
+    if not m:
+        return None
+    slug, match_id = m.group(1), m.group(2)
+    home, away = _humanize_slug(slug)
+    base_url = f"https://www.aiscore.com/match-{slug}/{match_id}"
+    return Fixture(match_id=match_id, slug=slug, url=base_url, home=home, away=away)
 
-    trajectory_ok = True
-    if len(odds_history) >= 4:
-        home_line = [entry[0] for entry in odds_history[:4]]
-        trajectory_ok = all(home_line[i] > home_line[i+1] for i in range(len(home_line)-1))
 
-    if (current_draw >= opening_draw) and trajectory_ok:
-        if drop_amount >= 2.0:
-            return "MATCH"
-        elif 1.2 <= drop_amount < 2.0:
-            return "NEAR_MISS"
-    return None
+def _target_home_url() -> str:
+    if not SCAN_DATE:
+        return "https://www.aiscore.com/"
+    raw = SCAN_DATE.strip()
+    if re.fullmatch(r"\d{8}", raw):
+        raw = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+    return f"https://www.aiscore.com/?date={raw}"
 
-def eval_sharp_move(odds_history: List[List[float]]):
-    if len(odds_history) < 2:
-        return None, 0.0
 
-    open_h, open_d, open_a = odds_history[0][0], odds_history[0][1], odds_history[0][2]
-    curr_h, curr_d, curr_a = odds_history[-1][0], odds_history[-1][1], odds_history[-1][2]
+def discover_fixtures(page) -> List[Fixture]:
+    target = _target_home_url()
+    logger.info("Opening AiScore fixture page: %s", target)
+    page.goto(target, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(4500)
 
-    if any(x <= 1.0 for x in [open_h, open_d, open_a, curr_h, curr_d, curr_a]):
-        return None, 0.0
+    # AiScore lazy-loads/virtualises some rows; several scrolls reveal more match links.
+    for _ in range(8):
+        page.mouse.wheel(0, 2200)
+        page.wait_for_timeout(450)
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(400)
 
-    raw_open_prob_h = 1.0 / open_h
-    raw_curr_prob_h = 1.0 / curr_h
+    hrefs = page.locator('a[href*="/match-"]').evaluate_all(
+        "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
+    )
 
-    open_vig = (1.0 / open_h) + (1.0 / open_d) + (1.0 / open_a)
-    curr_vig = (1.0 / curr_h) + (1.0 / curr_d) + (1.0 / curr_a)
+    fixtures: Dict[str, Fixture] = {}
+    for href in hrefs:
+        fixture = _normalise_fixture_href(href)
+        if fixture:
+            fixtures.setdefault(fixture.match_id, fixture)
 
-    fair_open_prob_h = raw_open_prob_h / open_vig
-    fair_curr_prob_h = raw_curr_prob_h / curr_vig
+    # Fallback: links may be rendered in canonical/meta markup even when cards are virtualised.
+    if not fixtures:
+        html = page.content()
+        for m in MATCH_RE.finditer(html):
+            fixture = _normalise_fixture_href(m.group(0))
+            if fixture:
+                fixtures.setdefault(fixture.match_id, fixture)
 
-    prob_shift = (fair_curr_prob_h - fair_open_prob_h) * 100.0
+    out = list(fixtures.values())[:MAX_MATCHES]
+    logger.info("Discovered %s unique AiScore match pages.", len(out))
+    return out
 
-    fair_open_prob_d = (1.0 / open_d) / open_vig
-    fair_curr_prob_d = (1.0 / curr_d) / curr_vig
-    if (fair_curr_prob_d - fair_open_prob_d) > 0.03:
-        return None, prob_shift
 
-    if len(odds_history) >= 3:
-        home_history = [entry[0] for entry in odds_history]
-        drops = sum(1 for i in range(len(home_history) - 1) if home_history[i] > home_history[i + 1])
-        if drops < 1:
-            return None, prob_shift
+def _is_decimal_odd(value: float) -> bool:
+    return 1.0 < value <= 100.0
 
-    if prob_shift >= 8.0:
-        return "MATCH", prob_shift
-    elif 5.0 <= prob_shift < 8.0:
-        return "NEAR_MISS", prob_shift
 
-    return None, prob_shift
+def _numbers(text: str) -> List[float]:
+    vals = []
+    for token in ODDS_RE.findall(text or ""):
+        try:
+            v = float(token)
+        except ValueError:
+            continue
+        if _is_decimal_odd(v):
+            vals.append(v)
+    return vals
 
-# --- DUAL-ENGINE SCRAPING ARCHITECTURE ---
-def fetch_via_cffi() -> List[Dict[str, Any]]:
-    """Primary Execution Tier: C-Based TLS Fingerprint Spoofing"""
-    url = "https://api.aiscore.com/api/v1/match/list"
-    if SCAN_DATE:
-        url = f"https://api.aiscore.com/api/v1/match/list?date={SCAN_DATE}"
 
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.aiscore.com/",
-        "Origin": "https://www.aiscore.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
+def _clean_bookmaker_name(text: str) -> str:
+    cleaned = re.sub(r"\d{1,3}(?:\.\d+)?", " ", text or "")
+    cleaned = re.sub(r"\b(?:opening|pre-match|prematch|in-play|inplay|odds|1x2|1\s*x\s*2)\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -|:\n\t")
+    return cleaned[:50] or "AiScore"
 
-    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
+def _extract_1x2_section(page) -> List[OddsRow]:
+    """Parse the first rendered bookmaker/market row in AiScore's 1X2 section.
+
+    The first six decimal values after the 1X2 heading are the first displayed
+    row's opening H/D/A and pre-match H/D/A. A seventh-ninth triple, when
+    present, is in-play. We deliberately stop after the first row so nested
+    mobile markup cannot shift bookmaker boundaries and create false signals.
+    """
+    body = page.locator("body").inner_text(timeout=8000)
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+
+    start = None
+    for i, line in enumerate(lines):
+        compact = re.sub(r"\s+", "", line).upper()
+        if compact == "1X2":
+            start = i + 1
+            break
+    if start is None:
+        return []
+
+    values: List[float] = []
+    for line in lines[start:]:
+        low = line.lower()
+        if low.startswith("asian handicap") or low == "handicap" or low.startswith("goals") or low.startswith("total goals"):
+            break
+
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3})?", line):
+            value = float(line)
+            if _is_decimal_odd(value):
+                values.append(value)
+        else:
+            for token in re.findall(r"(?<![\d.])\d{1,3}\.\d{1,3}(?![\d.])", line):
+                value = float(token)
+                if _is_decimal_odd(value):
+                    values.append(value)
+
+        if len(values) >= 9:
+            break
+
+    if len(values) < 6:
+        return []
+
+    opening = tuple(values[0:3])
+    prematch = tuple(values[3:6])
+    inplay = tuple(values[6:9]) if len(values) >= 9 else None
+    return [OddsRow("AiScore primary row", opening, prematch, inplay)]  # type: ignore[arg-type]
+
+
+def _extract_rows_from_dom(page) -> List[OddsRow]:
+    # AiScore has changed class names several times. We intentionally use semantic row-like
+    # containers and parse their rendered text instead of depending on a private CSS class.
+    texts = page.locator("tr, [role='row']").evaluate_all(
+        "els => els.map(e => (e.innerText || '').trim()).filter(Boolean)"
+    )
+
+    # Mobile odds pages often use div-based rows. Add compact elements containing enough odds.
+    compact = page.locator("div").evaluate_all(
+        r"""els => els.map(e => (e.innerText || '').trim())
+        .filter(t => t && t.length < 220 && /\d+\.\d+/.test(t))"""
+    )
+    texts.extend(compact)
+
+    seen = set()
+    rows: List[OddsRow] = []
+    for text in texts:
+        key = " ".join(text.split())
+        if key in seen:
+            continue
+        seen.add(key)
+        nums = _numbers(text)
+        # A bookmaker line in the dedicated odds section normally has
+        # opening H/D/A + pre-match H/D/A (+ optional in-play H/D/A).
+        if len(nums) < 6:
+            continue
+        opening = tuple(nums[0:3])
+        prematch = tuple(nums[3:6])
+        if not all(_is_decimal_odd(x) for x in opening + prematch):
+            continue
+        inplay = tuple(nums[6:9]) if len(nums) >= 9 and all(_is_decimal_odd(x) for x in nums[6:9]) else None
+        rows.append(
+            OddsRow(
+                bookmaker=_clean_bookmaker_name(text),
+                opening=opening,  # type: ignore[arg-type]
+                prematch=prematch,  # type: ignore[arg-type]
+                inplay=inplay,  # type: ignore[arg-type]
+            )
+        )
+
+    # Remove duplicate numeric rows created by nested divs.
+    unique: Dict[Tuple[Tuple[float, ...], Tuple[float, ...]], OddsRow] = {}
+    for row in rows:
+        unique.setdefault((row.opening, row.prematch), row)
+    return list(unique.values())
+
+
+def _extract_aggregate_from_body(page) -> List[OddsRow]:
+    """Fallback for the desktop/aggregate layout visible on AiScore match pages."""
+    body = page.locator("body").inner_text(timeout=8000)
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+
+    start = None
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"1\s*X\s*2", line, flags=re.I) or line.upper() == "1X2":
+            start = i + 1
+            break
+    if start is None:
+        return []
+
+    stop_words = ("asian handicap", "handicap", "goals", "total goals", "corners", "total corners")
+    section: List[str] = []
+    for line in lines[start:]:
+        if any(line.lower().startswith(word) for word in stop_words):
+            break
+        section.append(line)
+
+    vals: List[float] = []
+    for line in section:
+        # Avoid scores/times; the odds block consists mostly of decimal values.
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3})?", line):
+            v = float(line)
+            if _is_decimal_odd(v):
+                vals.append(v)
+        if len(vals) >= 9:
+            break
+
+    if len(vals) < 6:
+        return []
+
+    opening = tuple(vals[0:3])
+    prematch = tuple(vals[3:6])
+    inplay = tuple(vals[6:9]) if len(vals) >= 9 else None
+    return [OddsRow("AiScore aggregate", opening, prematch, inplay)]  # type: ignore[arg-type]
+
+
+def save_debug_capture(page, fixture: Fixture, reason: str) -> None:
+    global _debug_capture_count
+    if _debug_capture_count >= DEBUG_CAPTURE_LIMIT:
+        return
+    _debug_capture_count += 1
     try:
-        logger.info("Executing Tier 1 Scraping: TLS Impersonation (curl_cffi)...")
-        response = cffi_requests.get(url, headers=headers, proxies=proxies, impersonate="chrome120", timeout=15)
-        if response.status_code == 200:
-            data = response.json()
-            matches = data.get("data", {}).get("list", [])
-            if matches:
-                logger.info(f"Tier 1 Success: Acquired {len(matches)} match records.")
-                return matches
-    except Exception as e:
-        logger.error(f"Tier 1 Scraper failed: {e}")
-    return []
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", f"{fixture.match_id}_{reason}")[:120]
+        page.screenshot(path=os.path.join(DEBUG_DIR, f"{safe}.png"), full_page=True)
+        with open(os.path.join(DEBUG_DIR, f"{safe}.html"), "w", encoding="utf-8") as fh:
+            fh.write(page.content())
+        logger.info("Saved debug capture for %s", fixture.match_id)
+    except Exception as exc:
+        logger.debug("Debug capture failed: %s", exc)
 
-def fetch_via_playwright() -> List[Dict[str, Any]]:
-    """Secondary Execution Tier: Headless Browser Network Interception"""
-    logger.info("Executing Tier 2 Scraping: Playwright DOM Interceptor...")
-    captured_matches = []
+
+def scrape_fixture_odds(page, fixture: Fixture) -> List[OddsRow]:
+    logger.info("Odds page: %s vs %s -> %s", fixture.home, fixture.away, fixture.odds_url)
+
+    captured_json: List[Dict[str, Any]] = []
+
+    def on_response(response):
+        if "aiscore.com" not in response.url or response.status != 200:
+            return
+        if not any(key in response.url.lower() for key in ("odd", "match", "market")):
+            return
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                captured_json.append({"url": response.url, "data": data})
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+    try:
+        page.goto(fixture.odds_url, wait_until="domcontentloaded", timeout=40000)
+        page.wait_for_timeout(2800)
+
+        # The dedicated page can default to Asian Handicap. Select 1X2 when the tab exists.
+        for label in ("1 X 2", "1X2"):
+            try:
+                loc = page.get_by_text(label, exact=True)
+                if loc.count() and loc.first.is_visible():
+                    loc.first.click(timeout=2500)
+                    page.wait_for_timeout(900)
+                    break
+            except Exception:
+                pass
+
+        rows = _extract_1x2_section(page)
+        if not rows:
+            rows = _extract_rows_from_dom(page)
+        if not rows:
+            rows = _extract_aggregate_from_body(page)
+
+        # If mobile layout did not yield data, try the normal match page Odds tab; current
+        # AiScore pages expose opening and pre-match 1X2 directly there as well.
+        if not rows:
+            page.goto(fixture.url, wait_until="domcontentloaded", timeout=40000)
+            page.wait_for_timeout(2200)
+            rows = _extract_aggregate_from_body(page)
+
+        if not rows:
+            logger.warning(
+                "NO_ODDS_DATA for %s vs %s (captured %d odds/match JSON responses)",
+                fixture.home,
+                fixture.away,
+                len(captured_json),
+            )
+            save_debug_capture(page, fixture, "no_odds")
+        else:
+            logger.info("Parsed %d 1X2 odds row(s) for %s vs %s", len(rows), fixture.home, fixture.away)
+        return rows
+    except PlaywrightTimeoutError:
+        logger.warning("ODDS_PAGE_TIMEOUT for %s vs %s", fixture.home, fixture.away)
+        save_debug_capture(page, fixture, "timeout")
+        return []
+    except Exception as exc:
+        logger.warning("ODDS_PAGE_ERROR for %s vs %s: %s", fixture.home, fixture.away, exc)
+        save_debug_capture(page, fixture, "error")
+        return []
+    finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
+
+
+def _fair_probability(odds: Tuple[float, float, float], index: int) -> float:
+    inv = [1.0 / x for x in odds]
+    vig = sum(inv)
+    return inv[index] / vig if vig else 0.0
+
+
+def evaluate_odds_row(row: OddsRow) -> List[Candidate]:
+    """
+    Evaluate Home and Away separately.
+
+    Strict clean shape:
+      - selected side opening price 1.50-2.50
+      - selected side drops
+      - the other team side does not drop
+      - draw does not drop
+
+    AiScore's page gives opening -> pre-match snapshots, not every historical tick, so this
+    is labelled PROXY/SHARP rather than pretending it is a verified first-four sequence.
+    """
+    op = row.opening
+    cur = row.prematch
+    out: List[Candidate] = []
+
+    for side, idx, opp_idx in (("HOME", 0, 2), ("AWAY", 2, 0)):
+        selected_open = op[idx]
+        selected_cur = cur[idx]
+        if not (1.50 <= selected_open <= 2.50):
+            continue
+
+        selected_drop = selected_open - selected_cur
+        opp_drop = op[opp_idx] - cur[opp_idx]
+        draw_drop = op[1] - cur[1]
+        if selected_drop <= 0:
+            continue
+
+        drop_pct = (selected_drop / selected_open) * 100.0
+        fair_shift = (_fair_probability(cur, idx) - _fair_probability(op, idx)) * 100.0
+
+        other_team_not_dropping = opp_drop <= 0.005
+        draw_not_dropping = draw_drop <= 0.005
+        clean_shape = other_team_not_dropping and draw_not_dropping
+
+        # Meaningful line shortening in decimal odds. Old code required 1.20-2.00 absolute
+        # points, which is unrealistic for prices in the 1.50-2.50 range.
+        if clean_shape and (drop_pct >= 5.0 or fair_shift >= 2.5):
+            status = "SHARP_PROXY"
+            reason = "selected side shortened while draw and opponent held/rose"
+        elif clean_shape and (drop_pct >= 2.0 or fair_shift >= 1.0):
+            status = "NEAR_MISS"
+            reason = "clean one-sided movement, but strength is below sharp threshold"
+        elif drop_pct >= 3.0 and (not other_team_not_dropping or not draw_not_dropping):
+            status = "NEAR_MISS"
+            conflict = []
+            if not draw_not_dropping:
+                conflict.append("draw also shortened")
+            if not other_team_not_dropping:
+                conflict.append("opponent also shortened")
+            reason = "; ".join(conflict)
+        else:
+            continue
+
+        out.append(
+            Candidate(
+                side=side,
+                status=status,
+                bookmaker=row.bookmaker,
+                opening=op,
+                current=cur,
+                drop=selected_drop,
+                drop_pct=drop_pct,
+                fair_prob_shift=fair_shift,
+                reason=reason,
+            )
+        )
+
+    return out
+
+
+def _best_candidate(candidates: List[Candidate]) -> Optional[Candidate]:
+    if not candidates:
+        return None
+    rank = {"NEAR_MISS": 1, "SHARP_PROXY": 2}
+    return max(candidates, key=lambda c: (rank.get(c.status, 0), c.fair_prob_shift, c.drop_pct))
+
+
+def analyse_fixture(rows: List[OddsRow]) -> Optional[Candidate]:
+    all_candidates: List[Candidate] = []
+    for row in rows:
+        all_candidates.extend(evaluate_odds_row(row))
+    return _best_candidate(all_candidates)
+
+
+def _alert_level(status: str) -> int:
+    return 2 if status == "SHARP_PROXY" else 1
+
+
+def format_candidate_message(fixture: Fixture, candidate: Candidate) -> str:
+    op = candidate.opening
+    cur = candidate.current
+    side_name = fixture.home if candidate.side == "HOME" else fixture.away
+    header = "⚡ <b>SHARP MOVEMENT PROXY</b>" if candidate.status == "SHARP_PROXY" else "👀 <b>NEAR MISS</b>"
+    return (
+        f"{header}\n"
+        f"⚽ <b>{fixture.home} vs {fixture.away}</b>\n"
+        f"🎯 <b>Selected:</b> {side_name} ({candidate.side})\n"
+        f"🏦 <b>Source:</b> {candidate.bookmaker}\n\n"
+        f"📉 <b>Opening → Pre-match 1X2</b>\n"
+        f"Home: {op[0]:.2f} → {cur[0]:.2f}\n"
+        f"Draw: {op[1]:.2f} → {cur[1]:.2f}\n"
+        f"Away: {op[2]:.2f} → {cur[2]:.2f}\n\n"
+        f"Drop: {candidate.drop:.2f} ({candidate.drop_pct:.1f}%)\n"
+        f"No-vig probability shift: +{candidate.fair_prob_shift:.2f} pp\n"
+        f"Reason: {candidate.reason}\n\n"
+        f"ℹ️ Snapshot signal: AiScore opening → pre-match; not claimed as first-4 verified."
+    )
+
+
+def run_engine() -> None:
+    init_db()
+    stats = {
+        "fixtures": 0,
+        "with_odds": 0,
+        "no_odds": 0,
+        "sharp": 0,
+        "near": 0,
+        "sent": 0,
+    }
 
     launch_args = [
         "--no-sandbox",
         "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage"
     ]
 
     with sync_playwright() as p:
-        browser_options = {"headless": True, "args": launch_args}
+        browser_options: Dict[str, Any] = {"headless": HEADLESS, "args": launch_args}
         if PROXY_URL:
-            browser_options["proxy"] = {"server": PROXY_URL}
+            parsed = urlparse(PROXY_URL if "://" in PROXY_URL else f"http://{PROXY_URL}")
+            proxy: Dict[str, str] = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+            if parsed.username:
+                proxy["username"] = parsed.username
+            if parsed.password:
+                proxy["password"] = parsed.password
+            browser_options["proxy"] = proxy
 
         browser = p.chromium.launch(**browser_options)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080}
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1440, "height": 1000},
+            locale="en-US",
+            timezone_id="Indian/Mauritius",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "DNT": "1",
+            },
         )
         page = context.new_page()
-
-        def intercept_response(response):
-            nonlocal captured_matches
-            if "match" in response.url and response.status == 200:
-                try:
-                    data = response.json()
-                    match_list = data.get("data", {}).get("list", []) or data.get("list", [])
-                    if match_list and isinstance(match_list, list):
-                        captured_matches = match_list
-                except Exception:
-                    pass
-
-        page.on("response", intercept_response)
-
-        target_url = "https://www.aiscore.com/"
-        if SCAN_DATE:
-            target_url = f"https://www.aiscore.com/?date={SCAN_DATE}"
+        page.set_default_timeout(10000)
 
         try:
-            page.goto(target_url, wait_until="networkidle", timeout=35000)
-            page.wait_for_timeout(4000)
-        except Exception as e:
-            logger.error(f"Tier 2 Playwright Execution error: {e}")
-        finally:
+            fixtures = discover_fixtures(page)
+        except Exception as exc:
+            logger.exception("Fixture discovery failed: %s", exc)
+            fixtures = []
+
+        stats["fixtures"] = len(fixtures)
+        if not fixtures:
+            logger.error("No AiScore match links discovered.")
+            send_telegram_alert(
+                "🚨 <b>ODDS SCANNER ERROR</b>\nAiScore loaded, but no match URLs were discovered. Check the workflow log."
+            )
             browser.close()
+            return
 
-    logger.info(f"Tier 2 Scraping Complete: Captured {len(captured_matches)} match records.")
-    return captured_matches
+        for index, fixture in enumerate(fixtures, start=1):
+            logger.info("[%d/%d] Processing %s vs %s", index, len(fixtures), fixture.home, fixture.away)
+            rows = scrape_fixture_odds(page, fixture)
+            if not rows:
+                stats["no_odds"] += 1
+                continue
+            stats["with_odds"] += 1
 
-# --- PIPELINE CONTROLLER ---
-def run_engine():
-    init_db()
-
-    # Automatic Failover Routing
-    matches = fetch_via_cffi()
-    if not matches:
-        matches = fetch_via_playwright()
-
-    if not matches:
-        logger.error("Critical Failure: All scraping tiers exhausted with zero records.")
-        send_telegram_alert("🚨 <b>CRITICAL SYSTEM ALERT</b>\nScraper execution failed across all tiers.")
-        return
-
-    found_sharp = 0
-    found_classic = 0
-    found_near_misses = 0
-    total_scanned = len(matches)
-
-    for match in matches:
-        match_id = str(match.get("id") or match.get("matchId") or f"{match.get('homeTeam', {}).get('name')}_{match.get('awayTeam', {}).get('name')}")
-        home = match.get("homeTeam", {}).get("name", "Home")
-        away = match.get("awayTeam", {}).get("name", "Away")
-        league = match.get("leagueName", "League")
-
-        odds_history = extract_odds_history(match)
-        if not odds_history:
-            continue
-
-        classic_res = eval_classic_drop(odds_history)
-        sharp_res, prob_shift = eval_sharp_move(odds_history)
-
-        is_sharp_match = (sharp_res == "MATCH")
-        is_classic_match = (classic_res == "MATCH")
-        is_near_miss = (sharp_res == "NEAR_MISS" or classic_res == "NEAR_MISS") and not (is_sharp_match or is_classic_match)
-
-        if is_sharp_match or is_classic_match or is_near_miss:
-            # Deduplication Barrier
-            if is_already_alerted(match_id):
-                logger.info(f"Deduplicated match alert: {home} vs {away}")
+            candidate = analyse_fixture(rows)
+            if not candidate:
+                logger.info("REJECTED: %s vs %s - no clean/near movement", fixture.home, fixture.away)
                 continue
 
-            open_h, open_d, open_a = odds_history[0][0], odds_history[0][1], odds_history[0][2]
-            curr_h, curr_d, curr_a = odds_history[-1][0], odds_history[-1][1], odds_history[-1][2]
+            level = _alert_level(candidate.status)
+            previous = get_alert_level(fixture.match_id, candidate.side)
+            if previous >= level:
+                logger.info("DEDUP: %s %s already alerted at level %d", fixture.match_id, candidate.side, previous)
+                continue
 
-            alert_type = []
-            if is_sharp_match:
-                found_sharp += 1
-                alert_type.append(f"⚡ <b>SHARP STEAM</b> (+{prob_shift:.1f}% Shift)")
-            if is_classic_match:
-                found_classic += 1
-                alert_type.append(f"💥 <b>CLASSIC CRUSH</b> (Drop >= 2.0)")
+            if candidate.status == "SHARP_PROXY":
+                stats["sharp"] += 1
+            else:
+                stats["near"] += 1
 
-            if is_near_miss:
-                found_near_misses += 1
-                near_details = []
-                if sharp_res == "NEAR_MISS":
-                    near_details.append(f"Sharp Prob Shift +{prob_shift:.1f}% [Target +8.0%]")
-                if classic_res == "NEAR_MISS":
-                    near_details.append(f"Home Drop {open_h - curr_h:.2f} [Target >= 2.0]")
-                alert_type.append(f"🎯 <b>WATCHLIST</b> ({', '.join(near_details)})")
+            message = format_candidate_message(fixture, candidate)
+            if send_telegram_alert(message):
+                stats["sent"] += 1
+                record_alert(fixture.match_id, candidate.side, level, candidate.status)
+            else:
+                # Even with no Telegram secrets, print the candidate in Actions logs.
+                logger.info("CANDIDATE %s", re.sub(r"<[^>]+>", "", message).replace("\n", " | "))
 
-            header_icon = "🚨 <b>APEX MATCH TRIGGER</b>" if (is_sharp_match or is_classic_match) else "👀 <b>HIGH PRIORITY WATCHLIST</b>"
+            time.sleep(0.25)
 
-            msg = (
-                f"{header_icon}\n"
-                f"<b>Status:</b> {' | '.join(alert_type)}\n\n"
-                f"🏆 <b>League:</b> {league}\n"
-                f"⚽ <b>Match:</b> {home} vs {away}\n\n"
-                f"📊 <b>1X2 Odds Movement:</b>\n"
-                f"• Home: {open_h} ➔ {curr_h}\n"
-                f"• Draw: {open_d} ➔ {curr_d}\n"
-                f"• Away: {open_a} ➔ {curr_a}"
-            )
-            
-            if send_telegram_alert(msg):
-                record_alert(match_id, "|".join(alert_type))
-            time.sleep(0.5)
+        browser.close()
 
-    target = f"Date [{SCAN_DATE}]" if SCAN_DATE else "Today"
-    send_telegram_alert(
-        f"⚡ <b>SCAN COMPLETE ({target})</b>\n"
-        f"• Matches Scanned: {total_scanned}\n"
-        f"• 🔥 Sharp Steam Hits: {found_sharp}\n"
-        f"• 💥 Classic Line Crushes: {found_classic}\n"
-        f"• 🎯 Watchlist Candidates: {found_near_misses}"
+    target = SCAN_DATE or "today"
+    summary = (
+        f"✅ <b>SCAN COMPLETE ({target})</b>\n"
+        f"Matches discovered: {stats['fixtures']}\n"
+        f"Odds pages parsed: {stats['with_odds']}\n"
+        f"No odds available: {stats['no_odds']}\n"
+        f"Sharp proxies: {stats['sharp']}\n"
+        f"Near misses: {stats['near']}\n"
+        f"Alerts sent: {stats['sent']}"
     )
+    logger.info(re.sub(r"<[^>]+>", "", summary).replace("\n", " | "))
+    send_telegram_alert(summary)
+
 
 if __name__ == "__main__":
     run_engine()
