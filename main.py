@@ -1,7 +1,8 @@
 import os
+import json
 import time
 import requests
-import cloudscraper
+from playwright.sync_api import sync_playwright
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -70,39 +71,47 @@ def eval_sharp_move(odds_history):
 
     return None, prob_shift
 
-def check_odds():
-    # Initialize anti-Cloudflare scraper session
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'desktop': True
-        }
-    )
-
+def fetch_matches_with_playwright():
     url = "https://api.aiscore.com/api/v1/match/list"
     if SCAN_DATE:
         url = f"https://api.aiscore.com/api/v1/match/list?date={SCAN_DATE}"
 
-    matches = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080}
+        )
+        page = context.new_page()
 
-    try:
-        # Pre-flight request to solve Cloudflare challenge cookies
-        scraper.get("https://www.aiscore.com/", timeout=15)
-        time.sleep(2)
+        # Hide automation flags
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-        response = scraper.get(url, timeout=20)
-        
-        if response.status_code == 200:
-            data = response.json()
-            matches = data.get("data", {}).get("list", [])
-        else:
-            send_telegram_alert(f"⚠️ Scan Warning: AiScore returned status code {response.status_code}")
-            return
+        try:
+            page.goto("https://www.aiscore.com/", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+
+            # Execute fetch directly inside the authenticated browser context
+            raw_response = page.evaluate(f"""
+                async () => {{
+                    const res = await fetch('{url}');
+                    return await res.text();
+                }}
+            """)
             
-    except Exception as e:
-        send_telegram_alert(f"⚠️ Network Error: {e}")
-        return
+            browser.close()
+            data = json.loads(raw_response)
+            return data.get("data", {}).get("list", [])
+        except Exception as e:
+            browser.close()
+            send_telegram_alert(f"⚠️ Playwright Fetch Error: {e}")
+            return []
+
+def check_odds():
+    matches = fetch_matches_with_playwright()
 
     found_sharp = 0
     found_classic = 0
@@ -169,4 +178,3 @@ def check_odds():
 
 if __name__ == "__main__":
     check_odds()
-    
