@@ -1,0 +1,21 @@
+name: Daily Odds Check
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # Runs daily at 10:00 AM Mauritius time (06:00 UTC)
+  workflow_dispatch:    # Allows manual runs anytime
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
+        
