@@ -4,8 +4,8 @@ import json
 import time
 import sqlite3
 import logging
+import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -21,13 +21,35 @@ DB_FILE = os.getenv("DB_FILE", "odds_tracker.db")
 DEBUG_DIR = os.getenv("DEBUG_DIR", "debug")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 
-MOBILE_BASE = "https://m.aiscore.com"
-DESKTOP_BASE = "https://www.aiscore.com"
+_default_bases = [
+    "https://vnm.aiscore.com",
+    "https://m.aiscore.com",
+    "https://www.aiscore.com",
+]
+OFFICIAL_BASES = [x.strip().rstrip("/") for x in os.getenv("AISCORE_BASES", "").split(",") if x.strip()] or _default_bases
+
 MATCH_RE = re.compile(r"/match-([^/?#]+)/([a-z0-9]+)", re.I)
+LIVE_RE = re.compile(r"/live/football-[a-z0-9][a-z0-9-]*", re.I)
+PREDICTION_RE = re.compile(r"/prediction/football-[a-z0-9][a-z0-9-]*-prediction", re.I)
 DECIMAL_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3})?)(?![\d.])")
 
 logger = logging.getLogger("OddsEngine")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+@dataclass
+class FetchResult:
+    requested_url: str
+    final_url: str = ""
+    status: Optional[int] = None
+    html: str = ""
+    title: str = ""
+    blocked: bool = False
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.status == 200 and self.html and not self.blocked)
 
 
 @dataclass
@@ -36,14 +58,11 @@ class Fixture:
     slug: str
     home: str
     away: str
+    source_url: str = ""
 
     @property
-    def mobile_url(self) -> str:
-        return f"{MOBILE_BASE}/match-{self.slug}/{self.match_id}"
-
-    @property
-    def mobile_odds_url(self) -> str:
-        return f"{self.mobile_url}/odds"
+    def match_path(self) -> str:
+        return f"/match-{self.slug}/{self.match_id}" if self.slug and self.match_id else ""
 
 
 @dataclass
@@ -52,6 +71,7 @@ class OddsRow:
     opening: Tuple[float, float, float]
     prematch: Tuple[float, float, float]
     inplay: Optional[Tuple[float, float, float]] = None
+    basis: str = "AiScore opening → pre-match"
 
 
 @dataclass
@@ -65,6 +85,7 @@ class Candidate:
     drop_pct: float
     fair_prob_shift: float
     reason: str
+    basis: str
     agreeing_rows: int = 1
     total_rows: int = 1
 
@@ -127,22 +148,38 @@ def record_alert(match_id: str, side: str, alert_level: int, alert_type: str) ->
     conn.close()
 
 
+def get_first_snapshot(match_id: str, market_row: int) -> Optional[Tuple[float, float, float]]:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT home, draw, away FROM odds_snapshots
+        WHERE match_id=? AND market_row=?
+        ORDER BY captured_at ASC, rowid ASC LIMIT 1
+        """,
+        (match_id, market_row),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return tuple(float(x) for x in row)
+
+
 def record_snapshots(match_id: str, rows: List[OddsRow]) -> None:
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     for idx, row in enumerate(rows, start=1):
+        current = tuple(float(x) for x in row.prematch)
         cur.execute(
             """
-            SELECT home, draw, away
-            FROM odds_snapshots
+            SELECT home, draw, away FROM odds_snapshots
             WHERE match_id=? AND market_row=?
-            ORDER BY captured_at DESC, rowid DESC
-            LIMIT 1
+            ORDER BY captured_at DESC, rowid DESC LIMIT 1
             """,
             (match_id, idx),
         )
         last = cur.fetchone()
-        current = tuple(float(x) for x in row.prematch)
         if last and all(abs(float(last[i]) - current[i]) < 1e-9 for i in range(3)):
             continue
         cur.execute(
@@ -181,14 +218,15 @@ def make_session() -> requests.Session:
     s.headers.update(
         {
             "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Mobile Safari/537.36"
+                "Chrome/131.0.0.0 Safari/537.36"
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
+            "Referer": "https://www.google.com/",
         }
     )
     if PROXY_URL:
@@ -198,7 +236,7 @@ def make_session() -> requests.Session:
 
 
 def is_security_challenge(html: str, title: str = "") -> bool:
-    hay = f"{title}\n{html[:120000]}".lower()
+    hay = f"{title}\n{html[:160000]}".lower()
     signatures = (
         "just a moment",
         "performing security verification",
@@ -206,11 +244,29 @@ def is_security_challenge(html: str, title: str = "") -> bool:
         "cf-chl-",
         "challenge-platform",
         "cloudflare ray id",
+        "attention required",
     )
     return any(sig in hay for sig in signatures)
 
 
-def fetch_html(session: requests.Session, url: str, label: str) -> Optional[str]:
+def _safe_name(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value)[:120]
+
+
+def save_text_debug(name: str, html: str = "", data: Optional[Dict[str, Any]] = None) -> None:
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    safe = _safe_name(name)
+    if html:
+        with open(os.path.join(DEBUG_DIR, f"{safe}.html"), "w", encoding="utf-8") as fh:
+            fh.write(html)
+    if data is not None:
+        with open(os.path.join(DEBUG_DIR, f"{safe}.json"), "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+
+
+def fetch_html(session: requests.Session, url: str, label: str, save_failure: bool = True) -> FetchResult:
+    last = FetchResult(requested_url=url)
+    attempts = []
     for attempt in range(3):
         try:
             r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
@@ -220,28 +276,59 @@ def fetch_html(session: requests.Session, url: str, label: str) -> Optional[str]
                 m = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.I | re.S)
                 if m:
                     title = re.sub(r"\s+", " ", m.group(1)).strip()
+            blocked = is_security_challenge(text, title)
+            last = FetchResult(
+                requested_url=url,
+                final_url=str(r.url),
+                status=r.status_code,
+                html=text,
+                title=title,
+                blocked=blocked,
+            )
+            attempts.append(
+                {
+                    "attempt": attempt + 1,
+                    "status": r.status_code,
+                    "final_url": str(r.url),
+                    "title": title,
+                    "blocked": blocked,
+                    "content_length": len(text),
+                    "server": r.headers.get("server", ""),
+                    "content_type": r.headers.get("content-type", ""),
+                }
+            )
             logger.info("%s HTTP %s -> %s", label, r.status_code, r.url)
-            if is_security_challenge(text, title):
+            if blocked:
                 logger.warning("%s SECURITY_CHALLENGE at %s", label, r.url)
-                return None
+                break
             if r.status_code == 200 and text:
-                return text
+                return last
             logger.warning("%s HTTP %s", label, r.status_code)
         except Exception as exc:
+            last = FetchResult(requested_url=url, error=f"{type(exc).__name__}: {exc}")
+            attempts.append({"attempt": attempt + 1, "error": last.error})
             logger.warning("%s attempt %d failed: %s", label, attempt + 1, exc)
         time.sleep(1.5 * (attempt + 1))
-    return None
 
-
-def save_text_debug(name: str, html: str = "", data: Optional[Dict[str, Any]] = None) -> None:
-    os.makedirs(DEBUG_DIR, exist_ok=True)
-    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name)[:100]
-    if html:
-        with open(os.path.join(DEBUG_DIR, f"{safe}.html"), "w", encoding="utf-8") as fh:
-            fh.write(html)
-    if data is not None:
-        with open(os.path.join(DEBUG_DIR, f"{safe}.json"), "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
+    if save_failure:
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+        save_text_debug(
+            f"fetch_failure_{digest}",
+            last.html,
+            {
+                "label": label,
+                "url": url,
+                "attempts": attempts,
+                "last": {
+                    "final_url": last.final_url,
+                    "status": last.status,
+                    "title": last.title,
+                    "blocked": last.blocked,
+                    "error": last.error,
+                },
+            },
+        )
+    return last
 
 
 def humanize_slug(slug: str) -> Tuple[str, str]:
@@ -253,81 +340,163 @@ def humanize_slug(slug: str) -> Tuple[str, str]:
     return slug.replace("-", " ").title(), "Opponent"
 
 
-def normalise_fixture_href(href: str) -> Optional[Fixture]:
+def normalise_fixture_href(href: str, source_url: str = "") -> Optional[Fixture]:
     if not href:
         return None
-    m = MATCH_RE.search(href.replace("\\/", "/"))
+    cleaned = href.replace("\\/", "/")
+    m = MATCH_RE.search(cleaned)
     if not m:
         return None
     slug, match_id = m.group(1), m.group(2)
     home, away = humanize_slug(slug)
-    return Fixture(match_id=match_id, slug=slug, home=home, away=away)
+    return Fixture(match_id=match_id, slug=slug, home=home, away=away, source_url=source_url)
 
 
-def mobile_discovery_urls() -> List[str]:
-    if not SCAN_DATE:
-        return [
-            f"{MOBILE_BASE}/today-matches/football",
-            f"{MOBILE_BASE}/today-matches",
-            f"{MOBILE_BASE}/",
-        ]
-    raw = SCAN_DATE
-    if re.fullmatch(r"\d{8}", raw):
-        raw = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
-    return [
-        f"{MOBILE_BASE}/today-matches/football?date={raw}",
-        f"{MOBILE_BASE}/today-matches?date={raw}",
-    ]
+def _route_urls(html: str, final_url: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    found = []
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        if LIVE_RE.search(href) or PREDICTION_RE.search(href):
+            found.append(urljoin(final_url, href))
+    cleaned = html.replace("\\/", "/")
+    for rx in (LIVE_RE, PREDICTION_RE):
+        for m in rx.finditer(cleaned):
+            found.append(urljoin(final_url, m.group(0)))
+    return list(dict.fromkeys(found))
+
+
+def _extract_canonical_fixtures(html: str, source_url: str) -> List[Fixture]:
+    fixtures: Dict[str, Fixture] = {}
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = [a.get("href", "") for a in soup.find_all("a", href=True)]
+    cleaned = html.replace("\\/", "/")
+    candidates.extend(m.group(0) for m in MATCH_RE.finditer(cleaned))
+    canonical = soup.find("link", rel=lambda value: value and "canonical" in str(value).lower())
+    if canonical and canonical.get("href"):
+        candidates.append(canonical.get("href"))
+    for href in candidates:
+        fx = normalise_fixture_href(href, source_url=source_url)
+        if fx:
+            fixtures.setdefault(fx.match_id, fx)
+    return list(fixtures.values())
+
+
+def _fallback_fixture_from_route(route_url: str) -> Optional[Fixture]:
+    path = urlparse(route_url).path.strip("/")
+    slug = ""
+    if path.startswith("live/football-"):
+        slug = path[len("live/football-"):]
+    elif path.startswith("prediction/football-") and path.endswith("-prediction"):
+        slug = path[len("prediction/football-"):-len("-prediction")]
+    if "-vs-" not in slug:
+        return None
+    home, away = humanize_slug(slug)
+    synthetic = "route_" + hashlib.sha1(route_url.encode("utf-8")).hexdigest()[:16]
+    return Fixture(match_id=synthetic, slug=slug, home=home, away=away, source_url=route_url)
+
+
+def discovery_targets(base: str) -> List[str]:
+    host = urlparse(base).netloc.lower()
+    if "vnm.aiscore.com" in host:
+        paths = ["/prediction", "/live", "/"]
+    elif "m.aiscore.com" in host:
+        paths = ["/today-matches/football", "/today-matches", "/live", "/"]
+    else:
+        paths = ["/live", "/football", "/"]
+    if SCAN_DATE:
+        raw = SCAN_DATE
+        if re.fullmatch(r"\d{8}", raw):
+            raw = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+        dated = []
+        for p in paths:
+            joiner = "&" if "?" in p else "?"
+            dated.append(f"{p}{joiner}date={raw}")
+        paths = dated + paths
+    return [urljoin(base + "/", p.lstrip("/")) for p in paths]
 
 
 def discover_fixtures(session: requests.Session) -> List[Fixture]:
     fixtures: Dict[str, Fixture] = {}
+    route_queue: List[str] = []
     attempts: List[Dict[str, Any]] = []
-    last_html = ""
 
-    for target in mobile_discovery_urls():
-        logger.info("Opening AiScore mobile fixture page: %s", target)
-        html = fetch_html(session, target, "DISCOVERY")
-        if not html:
-            attempts.append({"url": target, "status": "blocked_or_failed"})
-            continue
-        last_html = html
-        soup = BeautifulSoup(html, "html.parser")
-        hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-        candidates = list(hrefs)
-        candidates.extend(m.group(0) for m in MATCH_RE.finditer(html.replace("\\/", "/")))
-
-        before = len(fixtures)
-        for href in candidates:
-            fixture = normalise_fixture_href(href)
-            if fixture:
-                fixtures.setdefault(fixture.match_id, fixture)
+    for base in OFFICIAL_BASES:
+        for target in discovery_targets(base):
+            if len(fixtures) >= MAX_MATCHES:
+                break
+            result = fetch_html(session, target, "DISCOVERY", save_failure=True)
+            attempts.append(
+                {
+                    "url": target,
+                    "status": result.status,
+                    "ok": result.ok,
+                    "blocked": result.blocked,
+                    "title": result.title,
+                    "final_url": result.final_url,
+                    "error": result.error,
+                }
+            )
+            if not result.ok:
+                continue
+            direct = _extract_canonical_fixtures(result.html, result.final_url or target)
+            for fx in direct:
+                fixtures.setdefault(fx.match_id, fx)
                 if len(fixtures) >= MAX_MATCHES:
                     break
-
-        attempts.append(
-            {
-                "url": target,
-                "status": "ok",
-                "href_count": len(hrefs),
-                "new_matches": len(fixtures) - before,
-                "total_matches": len(fixtures),
-            }
-        )
-        logger.info("Discovery found %d unique match IDs so far", len(fixtures))
+            route_queue.extend(_route_urls(result.html, result.final_url or target))
+            route_queue = list(dict.fromkeys(route_queue))
+            logger.info("Discovery direct=%d route_candidates=%d", len(fixtures), len(route_queue))
+            if len(fixtures) >= min(MAX_MATCHES, 20):
+                break
         if len(fixtures) >= min(MAX_MATCHES, 20):
             break
 
-    if not fixtures:
-        save_text_debug("fixture_discovery_mobile", last_html, {"attempts": attempts})
-    else:
-        save_text_debug("fixture_discovery_mobile_summary", data={"attempts": attempts, "count": len(fixtures)})
+    resolution_budget = min(max(MAX_MATCHES * 2, 30), 180)
+    resolved = 0
+    for route_url in route_queue:
+        if len(fixtures) >= MAX_MATCHES or resolved >= resolution_budget:
+            break
+        resolved += 1
+        result = fetch_html(session, route_url, "RESOLVE", save_failure=False)
+        if not result.ok:
+            continue
+        canonical = _extract_canonical_fixtures(result.html, route_url)
+        if canonical:
+            for fx in canonical:
+                fx.source_url = route_url
+                fixtures.setdefault(fx.match_id, fx)
+        else:
+            fallback = _fallback_fixture_from_route(route_url)
+            if fallback:
+                fixtures.setdefault(fallback.match_id, fallback)
+        logger.info("Route resolution %d/%d -> fixtures=%d", resolved, len(route_queue), len(fixtures))
 
+    save_text_debug(
+        "fixture_discovery_summary",
+        data={
+            "official_bases": OFFICIAL_BASES,
+            "attempts": attempts,
+            "route_candidates": len(route_queue),
+            "routes_resolved": resolved,
+            "fixtures": len(fixtures),
+            "sample": [
+                {
+                    "match_id": f.match_id,
+                    "slug": f.slug,
+                    "home": f.home,
+                    "away": f.away,
+                    "source_url": f.source_url,
+                }
+                for f in list(fixtures.values())[:20]
+            ],
+        },
+    )
     return list(fixtures.values())[:MAX_MATCHES]
 
 
 def _is_decimal_odd(value: float) -> bool:
-    return 1.0 < value <= 100.0
+    return 1.01 <= value <= 100.0
 
 
 def _line_triple(line: str) -> Optional[Tuple[float, float, float]]:
@@ -344,69 +513,80 @@ def _line_triple(line: str) -> Optional[Tuple[float, float, float]]:
     return None
 
 
-def _extract_mobile_1x2_rows(html: str) -> List[OddsRow]:
+def _extract_1x2_rows(html: str) -> List[OddsRow]:
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n", strip=True)
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    low_lines = [x.lower() for x in lines]
 
-    # The mobile page is server-rendered. Its current layout is:
-    # tabs -> "Opening odds" -> "1 X 2" -> repeating 3-number lines.
-    # Each provider row normally exposes opening, pre-match, and current/in-play.
-    start = None
-    for i, line in enumerate(lines):
-        if line.lower() == "opening odds":
-            for j in range(i + 1, min(i + 12, len(lines))):
-                if re.sub(r"\s+", "", lines[j]).upper() == "1X2":
-                    start = j + 1
-                    break
-            if start is not None:
-                break
+    start = 0
+    opening_markers = [i for i, x in enumerate(low_lines) if "opening odds" in x]
+    if opening_markers:
+        start = opening_markers[0]
 
-    if start is None:
-        # Fallback: use the last 1X2 marker near the odds section.
-        markers = [i for i, line in enumerate(lines) if re.sub(r"\s+", "", line).upper() == "1X2"]
-        if markers:
-            start = markers[-1] + 1
-    if start is None:
-        return []
+    for i in range(start, min(start + 50, len(lines))):
+        compact = re.sub(r"\s+", "", lines[i]).upper()
+        if compact in {"1X2", "1×2"}:
+            start = i + 1
+            break
+
+    stop = min(len(lines), start + 180)
+    stop_terms = ("asian handicap", "total goals", "total corners", "double chance", "correct score", "gamble responsibly")
+    for i in range(start + 1, min(len(lines), start + 180)):
+        if any(low_lines[i].startswith(term) for term in stop_terms):
+            stop = i
+            break
 
     triples: List[Tuple[float, float, float]] = []
-    for line in lines[start:]:
-        low = line.lower()
-        if (
-            low.startswith("gamble responsibly")
-            or low.startswith("opening odds pre-match odds")
-            or low.startswith("asian handicap")
-            or low.startswith("total goals")
-            or low.startswith("total corners")
-        ):
-            if triples:
-                break
-            continue
-        triple = _line_triple(line)
-        if triple:
-            triples.append(triple)
-            if len(triples) >= 30:
+    for line in lines[start:stop]:
+        t = _line_triple(line)
+        if t and t not in triples[-2:]:
+            triples.append(t)
+
+    # Table/div fallback: many regional pages keep the 1X2 values in one row/container.
+    if len(triples) < 2:
+        for tag in soup.find_all(["tr", "li", "div"]):
+            raw = re.sub(r"\s+", " ", tag.get_text(" ", strip=True))
+            if len(raw) > 240:
+                continue
+            nums = []
+            for token in DECIMAL_RE.findall(raw):
+                try:
+                    value = float(token)
+                except ValueError:
+                    continue
+                if _is_decimal_odd(value):
+                    nums.append(value)
+            if len(nums) in (3, 6, 9):
+                for pos in range(0, len(nums), 3):
+                    tri = tuple(nums[pos:pos + 3])
+                    if len(tri) == 3 and tri not in triples:
+                        triples.append(tri)
+            if len(triples) >= 12:
                 break
 
-    if len(triples) < 2:
+    if not triples:
         return []
 
+    # Single visible triple: keep it as an observed AiScore 1X2 snapshot.
+    if len(triples) == 1:
+        return [
+            OddsRow(
+                bookmaker="AiScore observed 1X2",
+                opening=triples[0],
+                prematch=triples[0],
+                basis="Observed AiScore snapshot history",
+            )
+        ]
+
+    section_text = " ".join(low_lines[max(0, start - 10):stop])
+    has_inplay = "in-play odds" in section_text or "in play odds" in section_text
+    group_size = 3 if has_inplay and len(triples) >= 3 else 2
+
     rows: List[OddsRow] = []
-
-    # Current AiScore mobile pages generally expose 3 triples per source:
-    # opening / pre-match / current-or-in-play. If only 2 are present, preserve that too.
-    if len(triples) >= 3 and len(triples) % 3 == 0:
-        group_size = 3
-    elif len(triples) % 2 == 0:
-        group_size = 2
-    else:
-        # Mixed markup: take complete triples in groups of three, then one final pair if present.
-        group_size = 3 if len(triples) >= 3 else 2
-
     pos = 0
     row_no = 1
-    while pos + 1 < len(triples):
+    while pos + 1 < len(triples) and row_no <= 12:
         opening = triples[pos]
         prematch = triples[pos + 1]
         inplay = triples[pos + 2] if group_size == 3 and pos + 2 < len(triples) else None
@@ -416,13 +596,11 @@ def _extract_mobile_1x2_rows(html: str) -> List[OddsRow]:
                 opening=opening,
                 prematch=prematch,
                 inplay=inplay,
+                basis="AiScore opening → pre-match",
             )
         )
-        row_no += 1
         pos += group_size
-        if row_no > 10:
-            break
-
+        row_no += 1
     return rows
 
 
@@ -433,6 +611,7 @@ def update_fixture_names(html: str, fixture: Fixture) -> None:
     patterns = [
         r"(.+?)\s+vs\s+(.+?)\s+betting odds\s+-\s+AiScore",
         r"(.+?)\s+vs\s+(.+?)\s+live score.*?\s+-\s+AiScore",
+        r"(.+?)\s+vs\s+(.+?)\s+Prediction\s+-\s+AiScore",
         r"(.+?)\s+vs\s+(.+?)\s+-\s+AiScore",
     ]
     for pattern in patterns:
@@ -447,21 +626,67 @@ def update_fixture_names(html: str, fixture: Fixture) -> None:
             return
 
 
-def scrape_fixture_odds(session: requests.Session, fixture: Fixture) -> List[OddsRow]:
-    logger.info("Odds page: %s vs %s -> %s", fixture.home, fixture.away, fixture.mobile_odds_url)
-    html = fetch_html(session, fixture.mobile_odds_url, f"ODDS {fixture.match_id}")
-    if not html:
-        return []
+def _candidate_page_urls(fixture: Fixture) -> List[str]:
+    urls = []
+    if fixture.match_id and not fixture.match_id.startswith("route_"):
+        for base in OFFICIAL_BASES:
+            urls.append(f"{base}{fixture.match_path}/odds")
+            urls.append(f"{base}{fixture.match_path}")
+    if fixture.source_url:
+        urls.append(fixture.source_url)
+    return list(dict.fromkeys(urls))
 
-    update_fixture_names(html, fixture)
-    rows = _extract_mobile_1x2_rows(html)
-    if rows:
-        logger.info("Parsed %d mobile 1X2 row(s) for %s vs %s", len(rows), fixture.home, fixture.away)
+
+def _apply_observed_baseline(fixture: Fixture, rows: List[OddsRow]) -> List[OddsRow]:
+    adjusted = []
+    for idx, row in enumerate(rows, start=1):
+        if row.basis != "Observed AiScore snapshot history":
+            adjusted.append(row)
+            continue
+        baseline = get_first_snapshot(fixture.match_id, idx)
+        if baseline:
+            adjusted.append(
+                OddsRow(
+                    bookmaker=row.bookmaker,
+                    opening=baseline,
+                    prematch=row.prematch,
+                    basis="Observed AiScore first snapshot → current",
+                )
+            )
+        else:
+            adjusted.append(row)
+    return adjusted
+
+
+def scrape_fixture_odds(session: requests.Session, fixture: Fixture) -> List[OddsRow]:
+    attempts = []
+    for url in _candidate_page_urls(fixture):
+        logger.info("Odds source: %s vs %s -> %s", fixture.home, fixture.away, url)
+        result = fetch_html(session, url, f"ODDS {fixture.match_id}", save_failure=False)
+        attempts.append(
+            {
+                "url": url,
+                "status": result.status,
+                "ok": result.ok,
+                "blocked": result.blocked,
+                "title": result.title,
+                "final_url": result.final_url,
+                "error": result.error,
+            }
+        )
+        if not result.ok:
+            continue
+        update_fixture_names(result.html, fixture)
+        rows = _extract_1x2_rows(result.html)
+        if not rows:
+            continue
+        rows = _apply_observed_baseline(fixture, rows)
         record_snapshots(fixture.match_id, rows)
+        logger.info("Parsed %d 1X2 row(s) for %s vs %s", len(rows), fixture.home, fixture.away)
         return rows
 
     logger.warning("NO_1X2_ODDS for %s vs %s", fixture.home, fixture.away)
-    save_text_debug(f"{fixture.match_id}_no_1x2", html, {"url": fixture.mobile_odds_url})
+    save_text_debug(f"{fixture.match_id}_odds_attempts", data={"fixture": fixture.__dict__, "attempts": attempts})
     return []
 
 
@@ -523,9 +748,9 @@ def evaluate_odds_row(row: OddsRow) -> List[Candidate]:
                 drop_pct=drop_pct,
                 fair_prob_shift=fair_shift,
                 reason=reason,
+                basis=row.basis,
             )
         )
-
     return out
 
 
@@ -538,7 +763,7 @@ def analyse_fixture(rows: List[OddsRow]) -> Optional[Candidate]:
     home = by_side["HOME"]
     away = by_side["AWAY"]
     if home and away:
-        logger.info("REJECTED: mixed Home/Away shortening across AiScore market rows")
+        logger.info("REJECTED: mixed Home/Away shortening across AiScore rows")
         return None
 
     side_candidates = home or away
@@ -551,14 +776,10 @@ def analyse_fixture(rows: List[OddsRow]) -> Optional[Candidate]:
     best = max(pool, key=lambda c: (c.fair_prob_shift, c.drop_pct))
     best.agreeing_rows = len(pool)
     best.total_rows = len(rows)
-
-    # Cross-row agreement strengthens a snapshot signal without pretending it is
-    # a historical first-four tick sequence.
     if sharp and len(sharp) >= 2:
         best.reason += f"; {len(sharp)}/{len(rows)} AiScore rows agree"
     elif near and len(near) >= 2:
         best.reason += f"; {len(near)}/{len(rows)} AiScore rows show the same side"
-
     return best
 
 
@@ -576,15 +797,16 @@ def format_candidate_message(fixture: Fixture, candidate: Candidate) -> str:
         f"⚽ <b>{fixture.home} vs {fixture.away}</b>\n"
         f"🎯 <b>Selected:</b> {side_name} ({candidate.side})\n"
         f"🏦 <b>Source:</b> {candidate.bookmaker}\n"
-        f"📊 <b>Agreement:</b> {candidate.agreeing_rows}/{candidate.total_rows} AiScore rows\n\n"
-        f"📉 <b>Opening → Pre-match 1X2</b>\n"
+        f"📊 <b>Agreement:</b> {candidate.agreeing_rows}/{candidate.total_rows} AiScore rows\n"
+        f"🧭 <b>Basis:</b> {candidate.basis}\n\n"
+        f"📉 <b>1X2</b>\n"
         f"Home: {op[0]:.2f} → {cur[0]:.2f}\n"
         f"Draw: {op[1]:.2f} → {cur[1]:.2f}\n"
         f"Away: {op[2]:.2f} → {cur[2]:.2f}\n\n"
         f"Drop: {candidate.drop:.2f} ({candidate.drop_pct:.1f}%)\n"
         f"No-vig probability shift: +{candidate.fair_prob_shift:.2f} pp\n"
         f"Reason: {candidate.reason}\n\n"
-        f"ℹ️ AiScore opening → pre-match snapshot. Repeated runs are stored separately; this is not labelled as first-4 verified."
+        f"ℹ️ Proxy/observed movement only unless a full AiScore opening→pre-match row was parsed."
     )
 
 
@@ -593,20 +815,21 @@ def run_engine() -> None:
     stats = {"fixtures": 0, "with_odds": 0, "no_odds": 0, "sharp": 0, "near": 0, "sent": 0}
     session = make_session()
 
+    logger.info("AiScore official hosts: %s", ", ".join(OFFICIAL_BASES))
     fixtures = discover_fixtures(session)
     stats["fixtures"] = len(fixtures)
 
     if not fixtures:
-        logger.error("No AiScore mobile match links discovered.")
+        logger.error("No AiScore match links discovered on any official host.")
         send_telegram_alert(
             "🚨 <b>ODDS SCANNER ERROR</b>\n"
-            "AiScore mobile discovery returned no match URLs. "
-            "The workflow artifact now shows whether the page was blocked or its markup changed."
+            "No AiScore fixtures were reachable from this runner. "
+            "Check fixture_discovery_summary.json and fetch_failure_*.json in the workflow artifact. "
+            "If all official hosts are blocked on a GitHub-hosted runner, use the included self-hosted workflow."
         )
         return
 
     logger.info("Discovered %d AiScore fixtures", len(fixtures))
-
     for index, fixture in enumerate(fixtures, start=1):
         logger.info("[%d/%d] Processing %s vs %s", index, len(fixtures), fixture.home, fixture.away)
         rows = scrape_fixture_odds(session, fixture)
@@ -637,7 +860,6 @@ def run_engine() -> None:
             record_alert(fixture.match_id, candidate.side, level, candidate.status)
         else:
             logger.info("CANDIDATE %s", re.sub(r"<[^>]+>", "", message).replace("\n", " | "))
-
         time.sleep(0.15)
 
     target = SCAN_DATE or "today"
